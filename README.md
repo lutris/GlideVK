@@ -74,10 +74,54 @@ rustup target add i686-pc-windows-gnu
 cargo build -p glide3x --release --target i686-pc-windows-gnu
 ```
 
+On macOS, some i686 MinGW packages (including Homebrew's current one) use the
+SJLJ exception runtime. Rust's prebuilt `i686-pc-windows-gnu` standard library
+expects the DWARF-2 `_Unwind_Resume` symbol, so those runtimes fail at link
+time with `undefined reference to '_Unwind_Resume'`. The workspace's
+`panic = "abort"` release setting does not change the already-built Rust std.
+This matches [Rust issue #158933](https://github.com/rust-lang/rust/issues/158933);
+the `build-std` workaround is tracked in [Rust issue #79609](https://github.com/rust-lang/rust/issues/79609).
+
+Use an i686 MinGW runtime that provides DWARF-2 unwinding, or rebuild Rust std
+with the project's aborting panic strategy using nightly:
+
+```sh
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+rustup target add --toolchain nightly i686-pc-windows-gnu
+cargo +nightly build -Z build-std=std,panic_abort -p glide3x --release --target i686-pc-windows-gnu
+```
+
+Replace `glide3x` with `glide2x` to build that DLL. The target must remain
+installed because `build-std` does not provide Rust's Windows startup objects.
+
+### GitHub Actions DLL artifacts and releases
+
+The [Windows DLLs workflow](.github/workflows/windows-dlls.yml) runs the native
+tests and Clippy, cross-builds both shipping PE32 DLLs with the pinned nightly
+`build-std` workaround, verifies that they are i686 DLLs with the expected
+exports, and uploads:
+
+- `glide2x.dll`
+- `glide3x.dll`
+- `SHA256SUMS`
+
+Every push, pull request, and manual workflow run gets a `glidevk-i686-windows`
+workflow artifact. Pushing a tag beginning with `v` also attaches those same
+three files to the corresponding GitHub Release.
+
 Exports are forced undecorated via `#[export_name]` and mirrored in
 [`crates/glide3x/glide3x.def`](crates/glide3x/glide3x.def) for the MinGW linker.
 Vulkan is reached through the in-prefix `vulkan-1.dll` → `winevulkan`, exactly as
 DXVK does. (`x86_64-w64-mingw32-gcc` and `wine` are the runtime prerequisites.)
+
+### Frame-rate limit
+
+GlideVK limits presentation to 60 frames per second by default in both Glide 2
+and Glide 3. Set the environment variable `GLIDEVK_FPS` to a whole number from
+1 to 1000 to change the limit, or set `GLIDEVK_FPS=0` to disable the limit.
+Invalid values fall back to 60. Set it before starting the game. The limit is a
+ceiling; rendering speed and display synchronization may produce a lower rate.
 
 ### Install into a Wine prefix (once the backend lands)
 

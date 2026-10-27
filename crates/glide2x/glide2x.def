@@ -16,6 +16,7 @@ EXPORTS
     _grColorCombine@20 = grColorCombine
     _grColorMask@8 = grColorMask
     _grConstantColorValue@4 = grConstantColorValue
+    _grCullMode@4 = grCullMode
     _grDepthBiasLevel@4 = grDepthBiasLevel
     _grDepthBufferFunction@4 = grDepthBufferFunction
     _grDepthBufferMode@4 = grDepthBufferMode

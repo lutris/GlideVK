@@ -225,16 +225,27 @@ pub extern "system" fn grBufferSwap(_swap_interval: i32) {
 }
 
 #[export_name = "grBufferClear"]
-pub extern "system" fn grBufferClear(color: u32, _alpha: u8, _depth: u32) {
+pub extern "system" fn grBufferClear(color: u32, alpha: u8, depth: u32) {
     with_ctx(|ctx| {
         // Glide clear color is packed per the context color format; assume RGBA.
         let r = ((color >> 24) & 0xff) as f32 / 255.0;
         let g = ((color >> 16) & 0xff) as f32 / 255.0;
         let b = ((color >> 8) & 0xff) as f32 / 255.0;
-        let a = (color & 0xff) as f32 / 255.0;
+        let a = alpha as f32 / 255.0;
         ctx.clear_color = [r, g, b, a];
         if let Some(backend) = ctx.backend.as_mut() {
-            backend.set_clear_color([r, g, b, a]);
+            if backend
+                .clear_masked(
+                    [r, g, b, a],
+                    depth,
+                    ctx.state.color_mask_rgb,
+                    ctx.state.color_mask_alpha,
+                    ctx.state.depth_write,
+                )
+                .is_err()
+            {
+                ctx.present_errors += 1;
+            }
         }
     });
 }
@@ -479,8 +490,10 @@ fn to_triangle_list(mode: i32, v: &[DrawVertex]) -> Vec<DrawVertex> {
     let mut out = Vec::new();
     match mode {
         GR_TRIANGLES => {
-            for c in v.chunks_exact(3) {
-                out.extend_from_slice(c);
+            let (triangles, remainder) = v.as_chunks::<3>();
+            debug_assert!(remainder.is_empty());
+            for triangle in triangles {
+                out.extend_from_slice(triangle);
             }
         }
         GR_TRIANGLE_STRIP => {
@@ -697,15 +710,22 @@ unsafe fn download_texture(start_address: u32, info: &GrTexInfo) {
         // at that moment (Glide applies its LUT when drawing; games upload a
         // texture's palette after binding it) — see `Context::bind_for_draw`.
         if matches!(fmt, TexFormat::P8) {
-            ctx.download_p8(start_address, w, h, src.to_vec());
+            ctx.download_p8(start_address, w, h, src);
             return;
         }
         let decoded = match ctx.textures.decode(fmt, w, h, src) {
             Ok(t) => t,
             Err(_) => return,
         };
+        ctx.clear_p8(start_address);
         if let Some(backend) = ctx.backend.as_mut() {
-            let _ = backend.upload_texture(start_address as u64, w, h, &decoded.rgba);
+            if backend
+                .upload_texture(start_address as u64, w, h, &decoded.rgba)
+                .is_ok()
+                && ctx.bound_texture == start_address
+            {
+                backend.set_texture(start_address as u64);
+            }
         }
     });
 }
@@ -1151,9 +1171,13 @@ stub!("grFogColorValue", gr_fog_color(color: u32));
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// These tests exercise the process-global Glide context and therefore
+    /// must not run concurrently under Cargo's default test scheduler.
+    static CONTEXT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn context_lifecycle_and_state_routing() {
+        let _guard = CONTEXT_TEST_LOCK.lock().unwrap();
         assert_eq!(grSstWinOpen(0, 0, -1, 0, 0, 2, 1), 1);
         grColorCombine(0x1, 0x0, 0x0, 0x1, 0); // Local / Iterated / Texture
         let hit = with_ctx(|ctx| {
@@ -1188,6 +1212,7 @@ mod tests {
 
     #[test]
     fn tex_clamp_mode_toggles_flag() {
+        let _guard = CONTEXT_TEST_LOCK.lock().unwrap();
         assert_eq!(grSstWinOpen(0, 0, -1, 0, 0, 2, 1), 1);
         grTexClampMode(0, 1, 0); // s = CLAMP
         assert_eq!(with_ctx(|ctx| ctx.state.tex_clamp), Some(true));

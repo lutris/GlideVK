@@ -87,8 +87,18 @@ impl Context {
 
     /// Download of a `GR_TEXFMT_P_8` texture: keep its indices for draw-time
     /// decoding and drop the GPU variants of whatever was at `addr` before.
-    pub fn download_p8(&mut self, addr: u32, width: u32, height: u32, indices: Vec<u8>) {
+    pub fn download_p8(&mut self, addr: u32, width: u32, height: u32, indices: &[u8]) {
         let stale = self.textures.store_p8_source(addr, width, height, indices);
+        if let Some(b) = self.backend.as_mut() {
+            for key in stale {
+                b.release_texture(key);
+            }
+        }
+    }
+
+    /// Forget any P8 data replaced by a non-palettised texture download.
+    pub fn clear_p8(&mut self, addr: u32) {
+        let stale = self.textures.remove_p8_source(addr);
         if let Some(b) = self.backend.as_mut() {
             for key in stale {
                 b.release_texture(key);
@@ -101,20 +111,28 @@ impl Context {
     /// this (texture, palette) pair has no GPU copy yet.
     pub fn bind_for_draw(&mut self) -> Option<P8Uploaded> {
         let addr = self.bound_texture;
+        let b = self.backend.as_mut()?;
         let resolved = self.textures.p8_draw(addr)?;
         let palette_id = self.textures.palette_id();
-        let b = self.backend.as_mut()?;
         for key in resolved.release {
             b.release_texture(key);
         }
-        let uploaded = resolved.upload.map(|tex| {
-            let _ = b.upload_texture(resolved.key, tex.width, tex.height, &tex.rgba);
-            P8Uploaded {
+        let uploaded = if let Some(tex) = resolved.upload {
+            if b.upload_texture(resolved.key, tex.width, tex.height, &tex.rgba)
+                .is_err()
+            {
+                self.textures.forget_p8_variant(addr, palette_id);
+                b.set_texture(resolved.key);
+                return None;
+            }
+            Some(P8Uploaded {
                 addr,
                 palette_id,
                 texture: tex,
-            }
-        });
+            })
+        } else {
+            None
+        };
         b.set_texture(resolved.key);
         uploaded
     }

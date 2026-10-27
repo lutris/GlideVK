@@ -14,6 +14,7 @@ dumping each renderer's import table (`objdump -x ... | grep 'DLL Name: glide'`)
 | POD Gold | `PODX3Dfx.exe`, `donut.exe` | **glide2x** |
 | Deus Ex (Unreal) | `GlideDrv.dll` | **glide2x** |
 | Clive Barker's Undying (Unreal) | `GlideDrv.dll` | **glide2x** |
+| Metal Fatigue | `GlideRendEng.dll` | **glide2x** |
 | **Diablo II** | `D2Glide.dll` | **glide3x** ✅ |
 
 So a **`glide2x.dll` shell** (reusing `glidevk-core`) is the single biggest
@@ -266,10 +267,16 @@ equivalent itself (`glidevk-core::win32`): `grSstWinOpen` calls
 the game window a borderless popup of that size at the origin; `grSstWinClose`
 restores the desktop mode. Wine emulates the mode switch by scaling the
 fullscreen window and its mouse input to the monitor, which is what makes
-"fullscreen" and in-game resolution changes work. The swapchain now follows
-the window's surface extent every frame instead of waiting for an
-out-of-date error Wine does not always raise. `GLIDEVK_WINDOWED=1` keeps the
-desktop mode and renders into the window as-is (the harness runners set it).
+"fullscreen" and in-game resolution changes work. If Wine rejects a legacy mode
+(macOS commonly returns `BADMODE` for 1600x1200), GlideVK still makes the game
+window a borderless window covering its current monitor; the rejected mode
+remains the logical Glide coordinate space. The swapchain now follows the
+window's surface extent every frame instead of waiting for an out-of-date error
+Wine does not always raise. `GLIDEVK_WINDOWED=1` keeps the desktop mode and
+adds a draggable caption to the game window while preserving its client size;
+`GLIDEVK_WINDOWED=0` or leaving it unset selects the fullscreen path. The
+logical Glide resolution can still differ from that client size; the renderer
+scales to the client area.
 Note that toggling *off* fullscreen in the game still means Unreal's software
 renderer: GlideDrv is fullscreen-only by design, as on real hardware.
 
@@ -319,6 +326,18 @@ dots), the flickering "Deus" letter, and the intermittent level-transition
 re-init. The `GLIDEVK_CAPTURE=<file.ppm>` frame dump makes these debuggable
 offline.
 
+## Metal Fatigue — glide2x texture-memory accounting
+
+Metal Fatigue's `GlideRendEng.dll` uses `grTexMinAddress`,
+`grTexMaxAddress`, and `grTexCalcMemRequired` to lay out its own TMU heap.
+The latter therefore has to report the full inclusive LOD chain, including the
+SST-1's four-texel minimum/fetch granularity and final eight-byte alignment—not
+just the base mip. Returning only the base level makes consecutive textures
+overlap in game-managed TMU address space. A 1600×1200 run reached roughly
+53 FPS with no Vulkan presentation or texture-miss errors before an abrupt
+crash in the game renderer; the corrected accounting is the next isolated
+change to test against that path.
+
 ## Launch notes
 - Deus Ex: `examples/deusex_glidevk.sh install` then `run` (direct launch in
   the prefix; the Wine virtual desktop it used to need is gone). Set
@@ -363,10 +382,15 @@ bug above survived that. The fix is methodological:
   with texture, iterated and constant inputs chosen to be distinguishable.
 - `wine_wbuffer.c`: near-then-far and far-then-near quads under
   `GR_DEPTHBUFFER_WBUFFER` + `LEQUAL` with `ooz` left at 0, plus depth off.
-- Performance: with `GLIDEVK_LOG` on, a `perf` line every 120 frames gives
-  fps, draws and triangles per frame, and the CPU split between draw
-  submission and `grBufferSwap`. `GLIDEVK_TRACE_TIME=<a>..<b>` (seconds)
-  traces by wall time when the frame number is unpredictable.
+- Performance: set `GLIDEVK_LOG=1` and `GLIDEVK_PROFILE_ONLY=1` for a
+  lightweight `perf` line every 120 frames and slow texture-bind, download and
+  present calls (100 ms or more). Profile mode suppresses detailed vertex,
+  texture and call traces. Each line also reports the longest individual draw,
+  upload and present call in the sample, useful for short intermittent stalls.
+  Present timings include any sleep required by the `GLIDEVK_FPS` limit.
+  The upload time is included in draw submission time;
+  the first sample excludes work before the first swap. `GLIDEVK_TRACE_TIME=<a>..<b>`
+  (seconds) traces by wall time when detailed logging is enabled.
 - Diagnostics that made the palette bug visible: `GLIDEVK_TRACE_FRAMES=<n>` or
   `<start>..<end>` logs every traced call (downloads, palette uploads, binds,
   draws with blend/depth state, clears, swaps) in order for those frames; `GLIDEVK_TEXDUMP=<dir>` writes each

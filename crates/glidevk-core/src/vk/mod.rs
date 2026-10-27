@@ -17,11 +17,67 @@
 //! grDrawVertexArray) -> `present` (grBufferSwap). The frame's render pass is
 //! begun lazily on the first draw (or at present, for a bare clear).
 
+mod frame_pacer;
+
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::Cursor;
 
 use ash::vk;
+
+fn clear_aspects(rgb_write: bool, alpha_write: bool, depth_write: bool) -> vk::ImageAspectFlags {
+    let mut aspects = vk::ImageAspectFlags::empty();
+    if rgb_write || alpha_write {
+        aspects |= vk::ImageAspectFlags::COLOR;
+    }
+    if depth_write {
+        aspects |= vk::ImageAspectFlags::DEPTH;
+    }
+    aspects
+}
+
+fn clear_color_write_mask(rgb_write: bool, alpha_write: bool) -> u32 {
+    (if rgb_write { 7 } else { 0 }) | (if alpha_write { 8 } else { 0 })
+}
+
+/// Map logical Glide clip edges to Vulkan pixel-center bounds. Glide's minimum
+/// is inclusive and its maximum exclusive; lower-left origin reverses Y.
+fn clip_scissor(
+    bounds: Option<[u32; 4]>,
+    logical: (u32, u32),
+    extent: vk::Extent2D,
+    lower_left: bool,
+) -> vk::Rect2D {
+    let (width, height) = (logical.0.max(1), logical.1.max(1));
+    let [x0, y0, x1, y1] = bounds.unwrap_or([0, 0, width, height]);
+    let (x0, x1) = (x0.min(width), x1.min(width));
+    let (y0, y1) = (y0.min(height), y1.min(height));
+    let (y0, y1) = if lower_left {
+        (height - y1, height - y0)
+    } else {
+        (y0, y1)
+    };
+    // A pixel is inside when its center is within the scaled clip bounds.
+    let edge = |value: u32, src: u32, dst: u32| -> u32 {
+        let n = (2 * value as u128 * dst as u128).saturating_sub(src as u128);
+        n.div_ceil(2 * src as u128).min(dst as u128) as u32
+    };
+    let (left, right) = (edge(x0, width, extent.width), edge(x1, width, extent.width));
+    let (top, bottom) = (
+        edge(y0, height, extent.height),
+        edge(y1, height, extent.height),
+    );
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: left as i32,
+            y: top as i32,
+        },
+        extent: vk::Extent2D {
+            width: right.saturating_sub(left),
+            height: bottom.saturating_sub(top),
+        },
+    }
+}
 
 /// P2 combiner shaders, precompiled to SPIR-V (see `shaders/build.sh`). The
 /// fragment shader is an ubershader implementing the Glide combine units,
@@ -63,6 +119,19 @@ const VERTEX_STRIDE: u64 = std::mem::size_of::<DrawVertex>() as u64; // 40
 /// Per-frame vertex-buffer capacity (~29k verts). Draws beyond this are dropped
 /// rather than reallocating mid-frame (revisit in P4).
 const VERTEX_CAPACITY_BYTES: u64 = 1 << 20;
+
+/// Vulkan update commands accept at most 64 KiB per four-byte-aligned chunk.
+fn vertex_upload_chunks(vertices: &[DrawVertex]) -> impl Iterator<Item = (u64, &[u8])> {
+    let size = std::mem::size_of_val(vertices);
+    debug_assert_eq!(size % 4, 0);
+    // SAFETY: DrawVertex is repr(C), consists solely of initialized f32s, and
+    // its borrowed bytes cannot outlive the source slice.
+    let bytes = unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast::<u8>(), size) };
+    bytes
+        .chunks(65_536)
+        .enumerate()
+        .map(|(i, chunk)| ((i * 65_536) as u64, chunk))
+}
 
 /// Combine-unit configuration for a draw, as the shader consumes it. Each
 /// `[i32; 5]` is `[function, factor, local, other, invert]` using the
@@ -135,7 +204,10 @@ impl BlendConfig {
     /// Blend config from state; blending is off for the opaque identity.
     pub fn from_state(s: &crate::state::State) -> Self {
         use crate::types::BlendFactor;
-        let opaque = s.blend_src_rgb == BlendFactor::One && s.blend_dst_rgb == BlendFactor::Zero;
+        let opaque = s.blend_src_rgb == BlendFactor::One
+            && s.blend_dst_rgb == BlendFactor::Zero
+            && s.blend_src_alpha == BlendFactor::One
+            && s.blend_dst_alpha == BlendFactor::Zero;
         // VkColorComponentFlags: R=1, G=2, B=4, A=8.
         let mut write_mask = 0u32;
         if s.color_mask_rgb {
@@ -182,6 +254,7 @@ impl DepthConfig {
 struct PipeKey {
     blend: BlendConfig,
     depth: DepthConfig,
+    wireframe: bool,
 }
 
 /// Push-constant block shared by `combine.vert` / `combine.frag`. Layout must
@@ -242,10 +315,34 @@ struct GpuTexture {
     descriptor_clamp: vk::DescriptorSet,
     width: u32,
     height: u32,
-    /// Frame this texture was last bound in. A re-upload may only overwrite
-    /// the image in place when it was not bound in the frame being recorded;
+    /// Frame this texture was last bound or drawn. A re-upload may only overwrite
+    /// the image in place when it was not used in the frame being recorded;
     /// earlier frames are already complete (their fence is waited on).
     used_frame: u32,
+}
+
+fn mark_texture_drawn(textures: &mut HashMap<u64, GpuTexture>, key: Option<u64>, frame: u32) {
+    if let Some(texture) = key.and_then(|key| textures.get_mut(&key)) {
+        texture.used_frame = frame;
+    }
+}
+
+/// Upload resources kept alive until a later render submission has waited for
+/// the upload's semaphore. Texture downloads can arrive in large batches
+/// before the game's first `grBufferSwap`, so waiting for the queue after each
+/// individual upload stalls startup badly on Wine/MoltenVK.
+struct PendingUpload {
+    /// TMU address lets the cache avoid two deferred writes to the same image.
+    addr: Option<u64>,
+    command_buffer: vk::CommandBuffer,
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+}
+
+/// One queue submission for all texture transfers accumulated before a frame.
+struct SubmittedUploadBatch {
+    uploads: Vec<PendingUpload>,
+    ready: vk::Semaphore,
 }
 
 /// Surface + swapchain + per-image render targets.
@@ -257,8 +354,14 @@ struct Swapchain {
     format: vk::Format,
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
-    image_views: Vec<vk::ImageView>,
-    framebuffers: Vec<vk::Framebuffer>,
+    /// Presentation waits are indexed by image: reacquiring an image ensures
+    /// its previous present wait has completed before this semaphore is reused.
+    render_finished: Vec<vk::Semaphore>,
+    color_image: vk::Image,
+    color_memory: vk::DeviceMemory,
+    color_view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
+    targets_initialized: bool,
 }
 
 /// When the backend copies a presented frame to the host for
@@ -307,13 +410,13 @@ pub struct Backend {
 
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+    vertex_upload_command: vk::CommandBuffer,
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
     in_flight: vk::Fence,
 
     // Graphics: render pass, a pipeline cache keyed by baked state (blend +
     // depth), the shared pipeline layout + shader modules, a depth buffer, a
-    // persistently-mapped vertex buffer, and a 1-pixel readback for the tests.
+    // vertex buffer, and a 1-pixel readback for the tests.
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipelines: HashMap<PipeKey, vk::Pipeline>,
@@ -326,7 +429,10 @@ pub struct Backend {
     depth_view: vk::ImageView,
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
-    vertex_mapped: *mut u8,
+    /// CPU-side vertices for the frame being recorded.
+    vertices: Vec<DrawVertex>,
+    /// Draw calls dropped because the current frame exceeded the vertex buffer.
+    dropped_draws: u64,
     readback_buffer: vk::Buffer,
     readback_memory: vk::DeviceMemory,
     readback_mapped: *mut u8,
@@ -346,8 +452,14 @@ pub struct Backend {
     /// destroying them immediately faults the GPU — hold them until the frame's
     /// fence signals in `present_inner`, then destroy.
     retired_textures: Vec<GpuTexture>,
+    /// Ordered upload submissions not yet consumed by a frame submission.
+    pending_uploads: Vec<PendingUpload>,
+    /// Submitted upload batches waiting to be consumed by a render submission.
+    submitted_uploads: Vec<SubmittedUploadBatch>,
     default_texture: GpuTexture,
     current_desc: vk::DescriptorSet,
+    /// Cache key for the selected texture, if it is not the default texture.
+    current_texture_key: Option<u64>,
     /// The clamp-sampler descriptor for the currently bound texture; `draw`
     /// selects between this and `current_desc` per `clamp_mode`.
     current_desc_clamp: vk::DescriptorSet,
@@ -361,6 +473,8 @@ pub struct Backend {
     depth_cfg: DepthConfig,
     chroma: (bool, [f32; 3]),
     alpha_test: (i32, f32),
+    clip_window: Option<[u32; 4]>,
+    scissor_dirty: bool,
     /// 3dfx output gamma (`grGammaCorrectionValue`); 1.0 = identity. Applied in
     /// the combiner's final output to emulate the RAMDAC gamma ramp.
     gamma: f32,
@@ -403,6 +517,7 @@ pub struct Backend {
     capture_bytes: u64,
     capture: CaptureMode,
     frame_num: u32,
+    frame_pacer: frame_pacer::FramePacer,
     last_capture: Option<(u32, u32, u32, Vec<u8>)>, // (frame, w, h, rgba)
     /// Size of the frame `capture_buffer` currently holds: every presented
     /// frame is copied there on the GPU (cheap), so a framebuffer read always
@@ -480,6 +595,7 @@ impl Backend {
         instance: ash::Instance,
         surface: Option<(ash::khr::surface::Instance, vk::SurfaceKHR, vk::Extent2D)>,
     ) -> Result<Self, Error> {
+        let has_surface = surface.is_some();
         // SAFETY: `instance` is valid for the duration of these queries.
         let physicals = unsafe { instance.enumerate_physical_devices()? };
         let surface_ref = surface.as_ref().map(|(l, s, _)| (l, *s));
@@ -516,18 +632,18 @@ impl Backend {
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
             device.create_command_pool(&info, None)?
         };
-        let command_buffer = unsafe {
+        let (command_buffer, vertex_upload_command) = unsafe {
             let info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            device.allocate_command_buffers(&info)?[0]
+                .command_buffer_count(2);
+            let commands = device.allocate_command_buffers(&info)?;
+            (commands[0], commands[1])
         };
-        let (image_available, render_finished, in_flight) = unsafe {
+        let (image_available, in_flight) = unsafe {
             let sem = vk::SemaphoreCreateInfo::default();
             let fence = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             (
-                device.create_semaphore(&sem, None)?,
                 device.create_semaphore(&sem, None)?,
                 device.create_fence(&fence, None)?,
             )
@@ -535,13 +651,13 @@ impl Backend {
 
         // Vertex + readback buffers exist regardless of surface (harmless for
         // headless; the draw path just never runs there).
-        let (vertex_buffer, vertex_memory, vertex_mapped) = unsafe {
+        let (vertex_buffer, vertex_memory, _vertex_mapped) = unsafe {
             create_mapped_buffer(
                 &instance,
                 &device,
                 physical,
                 VERTEX_CAPACITY_BYTES,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
+                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 HostAccess::Upload,
             )?
         };
@@ -564,7 +680,7 @@ impl Backend {
             unsafe { create_sampler(&device, vk::SamplerAddressMode::CLAMP_TO_EDGE)? };
         let desc_set_layout = unsafe { create_desc_set_layout(&device)? };
         let desc_pool = unsafe { create_desc_pool(&device)? };
-        let default_texture = unsafe {
+        let (default_texture, initial_upload) = unsafe {
             create_gpu_texture(
                 &instance,
                 &device,
@@ -579,8 +695,11 @@ impl Backend {
                 1,
                 &[255, 255, 255, 255],
                 0,
+                has_surface,
+                None,
             )?
         };
+        let pending_uploads = initial_upload.into_iter().collect();
         let current_desc = default_texture.descriptor;
         let default_texture_desc_clamp = default_texture.descriptor_clamp;
 
@@ -620,7 +739,14 @@ impl Backend {
                 depth_memory = dm;
                 depth_view = dv;
                 let render_pass = create_render_pass(&device, sc.format)?;
-                create_framebuffers(&device, render_pass, depth_view, &mut sc)?;
+                create_framebuffers(
+                    &instance,
+                    &device,
+                    physical,
+                    render_pass,
+                    depth_view,
+                    &mut sc,
+                )?;
                 (Some(sc), render_pass)
             }
             None => (None, vk::RenderPass::null()),
@@ -658,8 +784,8 @@ impl Backend {
             queue,
             command_pool,
             command_buffer,
+            vertex_upload_command,
             image_available,
-            render_finished,
             in_flight,
             render_pass,
             pipeline_layout,
@@ -673,7 +799,8 @@ impl Backend {
             depth_view,
             vertex_buffer,
             vertex_memory,
-            vertex_mapped,
+            vertices: Vec::new(),
+            dropped_draws: 0,
             readback_buffer,
             readback_memory,
             readback_mapped,
@@ -683,8 +810,11 @@ impl Backend {
             desc_pool,
             textures: HashMap::new(),
             retired_textures: Vec::new(),
+            pending_uploads,
+            submitted_uploads: Vec::new(),
             default_texture,
             current_desc,
+            current_texture_key: None,
             current_desc_clamp: default_texture_desc_clamp,
             clamp_mode: false,
             current_tex_size: [1.0, 1.0],
@@ -693,6 +823,8 @@ impl Backend {
             depth_cfg: DepthConfig::default(),
             chroma: (false, [0.0; 3]),
             alpha_test: (7, 0.0), // GR_CMP_ALWAYS
+            clip_window: None,
+            scissor_dirty: true,
             gamma: 1.0,
             wireframe: std::env::var_os("GLIDEVK_WIREFRAME").is_some(),
             debug_flat: std::env::var_os("GLIDEVK_FLAT").is_some(),
@@ -712,6 +844,7 @@ impl Backend {
             capture_bytes: lfb_bytes,
             capture: CaptureMode::Off,
             frame_num: 0,
+            frame_pacer: frame_pacer::FramePacer::from_env(),
             last_capture: None,
             capture_extent: None,
             swapchain,
@@ -754,6 +887,7 @@ impl Backend {
     /// a `grSstWinOpen` re-open at a different resolution on a live backend.
     pub fn set_logical_size(&mut self, width: u32, height: u32) {
         self.logical_size = [width.max(1) as f32, height.max(1) as f32];
+        self.scissor_dirty = true;
     }
 
     /// Dimensions (px) of the currently-bound texture, exactly as fed to the
@@ -769,9 +903,158 @@ impl Backend {
         self.pending_clear = color;
     }
 
+    /// Clear the current Glide clip rectangle at the point the game requests it.
+    pub fn clear_masked(
+        &mut self,
+        color: [f32; 4],
+        depth: u32,
+        rgb_write: bool,
+        alpha_write: bool,
+        depth_write: bool,
+    ) -> Result<(), Error> {
+        self.pending_clear = color;
+        let aspects = clear_aspects(rgb_write, alpha_write, depth_write);
+        if self.swapchain.is_none() || aspects.is_empty() {
+            return Ok(());
+        }
+        self.ensure_frame()?;
+        let rect = clip_scissor(
+            self.clip_window,
+            self.logical_size(),
+            self.swapchain.as_ref().unwrap().extent,
+            self.y_sign < 0.0,
+        );
+        if rect.extent.width == 0 || rect.extent.height == 0 {
+            return Ok(());
+        }
+        let mut attachments = Vec::with_capacity(2);
+        if rgb_write != alpha_write {
+            // vkCmdClearAttachments ignores color write masks. A clipped quad
+            // with a masked pipeline preserves the unselected channels.
+            self.clear_color_masked(color, rgb_write, alpha_write)?;
+        } else if rgb_write && alpha_write {
+            attachments.push(vk::ClearAttachment {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                color_attachment: 0,
+                clear_value: vk::ClearValue {
+                    color: vk::ClearColorValue { float32: color },
+                },
+            });
+        }
+        if aspects.contains(vk::ImageAspectFlags::DEPTH) {
+            attachments.push(vk::ClearAttachment {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                color_attachment: 0,
+                clear_value: vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: depth.min(65535) as f32 / 65535.0,
+                        stencil: 0,
+                    },
+                },
+            });
+        }
+        let rect = vk::ClearRect {
+            rect,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        // SAFETY: ensure_frame began a render pass using a framebuffer that
+        // contains both attachments and rect is clamped to its extent.
+        if !attachments.is_empty() {
+            unsafe {
+                self.device
+                    .cmd_clear_attachments(self.command_buffer, &attachments, &[rect]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Draw an unblended constant-color quad for RGB-only or alpha-only clears.
+    /// All game state is restored before returning, including after an error.
+    fn clear_color_masked(
+        &mut self,
+        color: [f32; 4],
+        rgb_write: bool,
+        alpha_write: bool,
+    ) -> Result<(), Error> {
+        let needed = (self.vertex_count as u64 + 6) * VERTEX_STRIDE;
+        if needed > VERTEX_CAPACITY_BYTES {
+            return Err(Error::Loading(
+                "no vertex space for masked framebuffer clear".into(),
+            ));
+        }
+        let saved = (
+            self.blend,
+            self.depth_cfg,
+            self.combine,
+            self.chroma,
+            self.alpha_test,
+            self.gamma,
+            self.gamma_override,
+            self.wireframe,
+            self.debug_flat,
+        );
+        self.blend = BlendConfig {
+            write_mask: clear_color_write_mask(rgb_write, alpha_write),
+            ..BlendConfig::default()
+        };
+        self.depth_cfg = DepthConfig::default();
+        self.combine = CombineParams {
+            color: [1, 0, 1, 0, 0], // LOCAL / CONSTANT
+            alpha: [1, 0, 1, 0, 0],
+            const_color: color,
+            alpha_it_lighting: 0,
+        };
+        self.chroma = (false, [0.0; 3]);
+        self.alpha_test = (7, 0.0);
+        self.gamma = 1.0;
+        self.gamma_override = None;
+        self.wireframe = false;
+        self.debug_flat = false;
+        let [width, height] = self.logical_size;
+        let v = |x, y| DrawVertex {
+            pos: [x, y],
+            ..DrawVertex::default()
+        };
+        let quad = [
+            v(0.0, 0.0),
+            v(width, 0.0),
+            v(width, height),
+            v(0.0, 0.0),
+            v(width, height),
+            v(0.0, height),
+        ];
+        let result = self.draw_triangles(&quad);
+        (
+            self.blend,
+            self.depth_cfg,
+            self.combine,
+            self.chroma,
+            self.alpha_test,
+            self.gamma,
+            self.gamma_override,
+            self.wireframe,
+            self.debug_flat,
+        ) = saved;
+        result
+    }
+
     /// `true` for GR_ORIGIN_UPPER_LEFT (Vulkan-native), `false` for LOWER_LEFT.
     pub fn set_origin_upper_left(&mut self, upper_left: bool) {
         self.y_sign = if upper_left { 1.0 } else { -1.0 };
+        self.scissor_dirty = true;
+    }
+
+    /// Set a Glide clip rectangle (minimum inclusive, maximum exclusive).
+    /// Out-of-range or reversed bounds leave the previous window unchanged.
+    pub fn set_clip_window(&mut self, bounds: [u32; 4]) {
+        let (width, height) = self.logical_size();
+        if bounds[0] > bounds[2] || bounds[1] > bounds[3] || bounds[2] > width || bounds[3] > height
+        {
+            return;
+        }
+        self.clip_window = Some(bounds);
+        self.scissor_dirty = true;
     }
 
     /// Last presented frame's center-pixel color as RGBA. Smoke-test aid.
@@ -876,16 +1159,53 @@ impl Backend {
         if let Some(&p) = self.pipelines.get(&key) {
             return Ok(p);
         }
-        let pipeline = build_pipeline(
-            &self.device,
-            self.render_pass,
-            self.pipeline_layout,
-            self.vert_module,
-            self.frag_module,
-            key,
-        )?;
+        let pipeline = profile_vk_call("build_graphics_pipeline", || {
+            build_pipeline(
+                &self.device,
+                self.render_pass,
+                self.pipeline_layout,
+                self.vert_module,
+                self.frag_module,
+                key,
+            )
+        })?;
         self.pipelines.insert(key, pipeline);
         Ok(pipeline)
+    }
+
+    /// Submit all recorded texture copies as one batch. The render submission
+    /// waits on the batch semaphore, so many Glide downloads can be collected
+    /// without blocking the game's thread or creating one queue dependency per
+    /// texture.
+    fn submit_pending_uploads(&mut self) -> Result<(), Error> {
+        if self.pending_uploads.is_empty() {
+            return Ok(());
+        }
+        let ready = unsafe {
+            self.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
+        };
+        let commands: Vec<_> = self
+            .pending_uploads
+            .iter()
+            .map(|upload| upload.command_buffer)
+            .collect();
+        let signals = [ready];
+        let submit = vk::SubmitInfo::default()
+            .command_buffers(&commands)
+            .signal_semaphores(&signals);
+        if let Err(error) = profile_vk_call("upload_queue_submit", || unsafe {
+            self.device
+                .queue_submit(self.queue, &[submit], vk::Fence::null())
+        }) {
+            unsafe { self.device.destroy_semaphore(ready, None) };
+            return Err(error.into());
+        }
+        self.submitted_uploads.push(SubmittedUploadBatch {
+            uploads: std::mem::take(&mut self.pending_uploads),
+            ready,
+        });
+        Ok(())
     }
 
     /// Decode + upload a texture, keyed by its Glide TMU start address. Replaces
@@ -904,25 +1224,56 @@ impl Backend {
         // when the texture is not already bound in the frame being recorded;
         // earlier frames have completed (their fence is waited on at present).
         let frame = self.frame_num;
+        let deferred = self.swapchain.is_some();
+        let upload_already_pending = self
+            .pending_uploads
+            .iter()
+            .any(|upload| upload.addr == Some(addr))
+            || self
+                .submitted_uploads
+                .iter()
+                .any(|batch| batch.uploads.iter().any(|upload| upload.addr == Some(addr)));
         if let Some(existing) = self.textures.get(&addr) {
-            if existing.width == width && existing.height == height && existing.used_frame != frame
+            if existing.width == width
+                && existing.height == height
+                && existing.used_frame != frame
+                && !upload_already_pending
             {
                 let image = existing.image;
-                // SAFETY: owned handles; the image is in SHADER_READ_ONLY and
-                // unreferenced by the in-progress frame.
-                unsafe {
-                    upload_image_pixels(
-                        &self.instance,
-                        &self.device,
-                        self.physical,
-                        self.command_pool,
-                        self.queue,
-                        image,
-                        width,
-                        height,
-                        rgba,
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    )?;
+                if deferred {
+                    // The image is not bound in this frame. Record its update
+                    // for the next batched transfer submission.
+                    let upload = unsafe {
+                        record_image_upload(
+                            &self.instance,
+                            &self.device,
+                            self.physical,
+                            self.command_pool,
+                            image,
+                            width,
+                            height,
+                            rgba,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            Some(addr),
+                        )?
+                    };
+                    self.pending_uploads.push(upload);
+                } else {
+                    // Headless backends have no render submission to batch with.
+                    unsafe {
+                        upload_image_pixels_sync(
+                            &self.instance,
+                            &self.device,
+                            self.physical,
+                            self.command_pool,
+                            self.queue,
+                            image,
+                            width,
+                            height,
+                            rgba,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        )?;
+                    }
                 }
                 if let Some(t) = self.textures.get_mut(&addr) {
                     t.used_frame = frame;
@@ -931,7 +1282,7 @@ impl Backend {
             }
         }
         // SAFETY: all handles are owned by `self` and valid.
-        let tex = unsafe {
+        let (tex, pending) = profile_vk_call("create_gpu_texture_total", || unsafe {
             create_gpu_texture(
                 &self.instance,
                 &self.device,
@@ -946,14 +1297,24 @@ impl Backend {
                 height,
                 rgba,
                 frame,
-            )?
-        };
+                deferred,
+                Some(addr),
+            )
+        })?;
+        if let Some(upload) = pending {
+            self.pending_uploads.push(upload);
+        }
         if let Some(old) = self.textures.insert(addr, tex) {
             // Do NOT destroy eagerly: a re-upload can happen mid-frame (P8
             // palette re-decode) while draws already recorded this frame still
             // reference `old`. Retire it and destroy once the frame's fence
             // signals (see `present_inner`).
             self.retired_textures.push(old);
+            if self.current_texture_key == Some(addr) {
+                // Future draws must use the replacement descriptor; previous
+                // draws retain the old descriptor until the frame completes.
+                self.set_texture(addr);
+            }
         }
         Ok(())
     }
@@ -963,6 +1324,11 @@ impl Backend {
     /// Drop the texture under `key` once the current frame no longer needs it.
     pub fn release_texture(&mut self, key: u64) {
         if let Some(old) = self.textures.remove(&key) {
+            if self.current_texture_key == Some(key) {
+                // The selected descriptor is about to be retired. Switch to
+                // the default before it can be freed after the frame fence.
+                self.set_texture(key);
+            }
             self.retired_textures.push(old);
         }
     }
@@ -972,12 +1338,14 @@ impl Backend {
         match self.textures.get_mut(&addr) {
             Some(t) => {
                 t.used_frame = frame;
+                self.current_texture_key = Some(addr);
                 self.current_desc = t.descriptor;
                 self.current_desc_clamp = t.descriptor_clamp;
                 self.current_tex_size = [t.width as f32, t.height as f32];
                 true
             }
             None => {
+                self.current_texture_key = None;
                 self.current_desc = self.default_texture.descriptor;
                 self.current_desc_clamp = self.default_texture.descriptor_clamp;
                 self.current_tex_size = [1.0, 1.0];
@@ -992,19 +1360,43 @@ impl Backend {
         self.clamp_mode = clamp;
     }
 
+    /// Return and reset the number of draw calls dropped for lack of space.
+    pub fn take_dropped_draws(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped_draws)
+    }
+
     /// Record `verts` (a triangle list) into the in-progress frame, beginning
     /// the frame if needed. No-op for a headless context.
     pub fn draw_triangles(&mut self, verts: &[DrawVertex]) -> Result<(), Error> {
         if self.swapchain.is_none() || verts.is_empty() {
             return Ok(());
         }
-        self.ensure_frame()?;
+        profile_vk_call("draw_ensure_frame", || self.ensure_frame())?;
+
+        if self.scissor_dirty {
+            let extent = self.swapchain.as_ref().unwrap().extent;
+            let scissor = clip_scissor(
+                self.clip_window,
+                self.logical_size(),
+                extent,
+                self.y_sign < 0.0,
+            );
+            // SAFETY: the command buffer is recording inside the current render pass.
+            unsafe {
+                profile_vk_call("draw_set_scissor", || {
+                    self.device
+                        .cmd_set_scissor(self.command_buffer, 0, &[scissor])
+                })
+            };
+            self.scissor_dirty = false;
+        }
 
         let first = self.vertex_count;
         let byte_off = first as u64 * VERTEX_STRIDE;
         let bytes = std::mem::size_of_val(verts) as u64;
         if byte_off + bytes > VERTEX_CAPACITY_BYTES {
             // Over budget for this frame; drop rather than corrupt.
+            self.dropped_draws = self.dropped_draws.saturating_add(1);
             return Ok(());
         }
 
@@ -1014,11 +1406,13 @@ impl Backend {
             PipeKey {
                 blend: BlendConfig::default(),
                 depth: DepthConfig::default(),
+                wireframe: self.wireframe,
             }
         } else {
             PipeKey {
                 blend: self.blend,
                 depth: self.depth_cfg,
+                wireframe: self.wireframe,
             }
         };
         let pipeline = self.get_or_build_pipeline(key)?;
@@ -1066,47 +1460,58 @@ impl Backend {
             push.alpha_lighting = 0;
             push.gamma = 1.0;
         }
-        // SAFETY: `vertex_mapped` is a live host-coherent mapping of at least
-        // VERTEX_CAPACITY_BYTES; the bound check above keeps us in range. The
-        // descriptor/pipeline handles are owned by `self`.
+        // Keep draw data in ordinary CPU memory. Upload all vertices before
+        // submitting this frame, without writing to mapped Vulkan memory.
+        profile_vk_call("draw_vertex_copy", || {
+            self.vertices.extend_from_slice(verts)
+        });
+        // SAFETY: the descriptor/pipeline handles are owned by `self`.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                verts.as_ptr() as *const u8,
-                self.vertex_mapped.add(byte_off as usize),
-                bytes as usize,
-            );
-            self.device.cmd_bind_pipeline(
-                self.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline,
-            );
+            profile_vk_call("draw_bind_pipeline", || {
+                self.device.cmd_bind_pipeline(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline,
+                )
+            });
             let desc = if self.clamp_mode {
                 self.current_desc_clamp
             } else {
                 self.current_desc
             };
-            self.device.cmd_bind_descriptor_sets(
-                self.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[desc],
-                &[],
-            );
+            profile_vk_call("draw_bind_descriptors", || {
+                self.device.cmd_bind_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[desc],
+                    &[],
+                )
+            });
             let push_bytes = std::slice::from_raw_parts(
                 &push as *const PushConstants as *const u8,
                 std::mem::size_of::<PushConstants>(),
             );
-            self.device.cmd_push_constants(
-                self.command_buffer,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                push_bytes,
-            );
-            self.device
-                .cmd_draw(self.command_buffer, verts.len() as u32, 1, first, 0);
+            profile_vk_call("draw_push_constants", || {
+                self.device.cmd_push_constants(
+                    self.command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    push_bytes,
+                )
+            });
+            profile_vk_call("draw_command", || {
+                self.device
+                    .cmd_draw(self.command_buffer, verts.len() as u32, 1, first, 0)
+            });
         }
+        // Glide retains its texture binding across frames. Mark the texture
+        // actually referenced by this draw even if there was no grTexSource
+        // in the current frame, so later uploads cannot overwrite its image
+        // before the recorded commands execute.
+        mark_texture_drawn(&mut self.textures, self.current_texture_key, self.frame_num);
         self.vertex_count += verts.len() as u32;
         Ok(())
     }
@@ -1152,75 +1557,168 @@ impl Backend {
         // SAFETY: wait until the device is idle before destroying in-use objects.
         unsafe {
             let _ = self.device.device_wait_idle();
-            for &fb in &old.framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for &v in &old.image_views {
-                self.device.destroy_image_view(v, None);
+            self.device.destroy_framebuffer(old.framebuffer, None);
+            self.device.destroy_image_view(old.color_view, None);
+            self.device.destroy_image(old.color_image, None);
+            self.device.free_memory(old.color_memory, None);
+            for &semaphore in &old.render_finished {
+                self.device.destroy_semaphore(semaphore, None);
             }
             old.swapchain_loader.destroy_swapchain(old.swapchain, None);
             self.device.destroy_image_view(self.depth_view, None);
             self.device.destroy_image(self.depth_image, None);
             self.device.free_memory(self.depth_memory, None);
+            // Drop must not destroy these handles again if recreation fails.
+            self.depth_view = vk::ImageView::null();
+            self.depth_image = vk::Image::null();
+            self.depth_memory = vk::DeviceMemory::null();
         }
         // Reuse the surface; create_swapchain re-queries the current extent.
-        let mut sc = create_swapchain(
+        let surface_loader = old.surface_loader;
+        let mut sc = match create_swapchain(
             &self.instance,
             &self.device,
             self.physical,
-            old.surface_loader,
+            surface_loader.clone(),
             old.surface,
             self.render_extent,
-        )?;
-        self.render_extent = sc.extent;
-        // SAFETY: fresh device/physical handles.
-        let (di, dm, dv) =
-            unsafe { create_depth_buffer(&self.instance, &self.device, self.physical, sc.extent)? };
-        self.depth_image = di;
-        self.depth_memory = dm;
-        self.depth_view = dv;
-        create_framebuffers(&self.device, self.render_pass, dv, &mut sc)?;
-
-        // Resize LFB staging to the new extent.
-        let need = ((sc.extent.width * sc.extent.height * 4) as u64).max(4);
-        // SAFETY: old staging is no longer referenced by any in-flight command.
-        unsafe {
-            self.device.destroy_buffer(self.lfb_staging, None);
-            self.device.free_memory(self.lfb_staging_memory, None);
-            let (b, m, p) = create_mapped_buffer(
+        ) {
+            Ok(sc) => sc,
+            Err(error) => {
+                unsafe { surface_loader.destroy_surface(old.surface, None) };
+                return Err(error);
+            }
+        };
+        let result = (|| -> Result<(), Error> {
+            // SAFETY: fresh device/physical handles.
+            let (di, dm, dv) = unsafe {
+                create_depth_buffer(&self.instance, &self.device, self.physical, sc.extent)?
+            };
+            self.depth_image = di;
+            self.depth_memory = dm;
+            self.depth_view = dv;
+            create_framebuffers(
                 &self.instance,
                 &self.device,
                 self.physical,
-                need,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                HostAccess::Upload,
+                self.render_pass,
+                dv,
+                &mut sc,
             )?;
-            self.lfb_staging = b;
-            self.lfb_staging_memory = m;
-            self.lfb_staging_mapped = p;
 
-            // The capture buffer receives full-image copies: it must follow the
-            // swapchain too, or a larger mode overruns it on the GPU and the
-            // host read past its mapping.
-            self.device.destroy_buffer(self.capture_buffer, None);
-            self.device.free_memory(self.capture_memory, None);
-            let (b, m, p) = create_mapped_buffer(
-                &self.instance,
-                &self.device,
-                self.physical,
-                need,
-                vk::BufferUsageFlags::TRANSFER_DST,
-                HostAccess::Readback,
-            )?;
-            self.capture_buffer = b;
-            self.capture_memory = m;
-            self.capture_mapped = p;
-            self.capture_bytes = need;
-            self.capture_extent = None;
+            // Resize LFB staging to the new extent.
+            let need = ((sc.extent.width * sc.extent.height * 4) as u64).max(4);
+            // SAFETY: old staging is no longer referenced by any in-flight command.
+            unsafe {
+                let (b, m, p) = create_mapped_buffer(
+                    &self.instance,
+                    &self.device,
+                    self.physical,
+                    need,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    HostAccess::Upload,
+                )?;
+                self.device.destroy_buffer(self.lfb_staging, None);
+                self.device.free_memory(self.lfb_staging_memory, None);
+                self.lfb_staging = b;
+                self.lfb_staging_memory = m;
+                self.lfb_staging_mapped = p;
+
+                // The capture buffer receives full-image copies: it must follow the
+                // swapchain too, or a larger mode overruns it on the GPU and the
+                // host read past its mapping.
+                let (b, m, p) = create_mapped_buffer(
+                    &self.instance,
+                    &self.device,
+                    self.physical,
+                    need,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    HostAccess::Readback,
+                )?;
+                self.device.destroy_buffer(self.capture_buffer, None);
+                self.device.free_memory(self.capture_memory, None);
+                self.capture_buffer = b;
+                self.capture_memory = m;
+                self.capture_mapped = p;
+                self.capture_bytes = need;
+                self.capture_extent = None;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            unsafe {
+                self.device.destroy_framebuffer(sc.framebuffer, None);
+                self.device.destroy_image_view(sc.color_view, None);
+                self.device.destroy_image(sc.color_image, None);
+                self.device.free_memory(sc.color_memory, None);
+                for &semaphore in &sc.render_finished {
+                    self.device.destroy_semaphore(semaphore, None);
+                }
+                sc.swapchain_loader.destroy_swapchain(sc.swapchain, None);
+                sc.surface_loader.destroy_surface(sc.surface, None);
+                self.device.destroy_image_view(self.depth_view, None);
+                self.device.destroy_image(self.depth_image, None);
+                self.device.free_memory(self.depth_memory, None);
+            }
+            self.depth_view = vk::ImageView::null();
+            self.depth_image = vk::Image::null();
+            self.depth_memory = vk::DeviceMemory::null();
+            return Err(error);
         }
+        self.render_extent = sc.extent;
         self.swapchain = Some(sc);
         self.current_image = None;
         Ok(())
+    }
+
+    /// Record all vertex data outside the render pass, in a command buffer
+    /// submitted immediately before the frame's rendering commands.
+    fn record_vertex_upload(&self) -> Result<bool, Error> {
+        if self.vertices.is_empty() {
+            return Ok(false);
+        }
+        let size = std::mem::size_of_val(self.vertices.as_slice());
+        debug_assert_eq!(size % 4, 0);
+        unsafe {
+            self.device.reset_command_buffer(
+                self.vertex_upload_command,
+                vk::CommandBufferResetFlags::empty(),
+            )?;
+            self.device.begin_command_buffer(
+                self.vertex_upload_command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            for (offset, chunk) in vertex_upload_chunks(&self.vertices) {
+                profile_vk_call("vertex_command_update", || {
+                    self.device.cmd_update_buffer(
+                        self.vertex_upload_command,
+                        self.vertex_buffer,
+                        offset,
+                        chunk,
+                    )
+                });
+            }
+            let barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::VERTEX_ATTRIBUTE_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.vertex_buffer)
+                .offset(0)
+                .size(size as u64);
+            self.device.cmd_pipeline_barrier(
+                self.vertex_upload_command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::VERTEX_INPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[barrier],
+                &[],
+            );
+            self.device.end_command_buffer(self.vertex_upload_command)?;
+        }
+        Ok(true)
     }
 
     fn present_inner(&mut self) -> Result<(), Error> {
@@ -1231,7 +1729,9 @@ impl Backend {
         self.ensure_frame()?;
         let index = self.current_image.take().expect("frame begun above");
         let sc = self.swapchain.as_ref().unwrap();
-        let image = sc.images[index as usize];
+        let image = sc.color_image;
+        let swap_image = sc.images[index as usize];
+        let render_finished = sc.render_finished[index as usize];
         let extent = sc.extent;
 
         let color_range = vk::ImageSubresourceRange {
@@ -1358,15 +1858,59 @@ impl Backend {
                 );
             }
 
-            // TRANSFER_SRC_OPTIMAL -> PRESENT_SRC_KHR for the presentation engine.
+            // Copy the preserved logical framebuffer to the acquired swapchain image.
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(swap_image)
+                .subresource_range(color_range);
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            let subresource = vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let copy = vk::ImageCopy {
+                src_subresource: subresource,
+                src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                dst_subresource: subresource,
+                dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                extent: vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                },
+            };
+            self.device.cmd_copy_image(
+                self.command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                swap_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+            // TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR for the presentation engine.
             let barrier = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::empty())
-                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
+                .image(swap_image)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
@@ -1385,31 +1929,43 @@ impl Backend {
             );
             self.device.end_command_buffer(self.command_buffer)?;
 
-            let wait = [self.image_available];
-            let signal = [self.render_finished];
-            let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let cmd = [self.command_buffer];
+            let has_vertex_upload = self.record_vertex_upload()?;
+            self.submit_pending_uploads()?;
+            let mut wait = vec![self.image_available];
+            let mut stages = vec![vk::PipelineStageFlags::TRANSFER];
+            // All recorded texture copies were submitted as batches. Waiting
+            // here makes their image writes visible before the render commands.
+            for upload_batch in &self.submitted_uploads {
+                wait.push(upload_batch.ready);
+                stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+            }
+            let signal = [render_finished];
+            let cmd = if has_vertex_upload {
+                vec![self.vertex_upload_command, self.command_buffer]
+            } else {
+                vec![self.command_buffer]
+            };
             let submit = vk::SubmitInfo::default()
                 .wait_semaphores(&wait)
                 .wait_dst_stage_mask(&stages)
                 .command_buffers(&cmd)
                 .signal_semaphores(&signal);
             self.device.reset_fences(&[self.in_flight])?;
-            self.device
-                .queue_submit(self.queue, &[submit], self.in_flight)?;
-
-            let sc = self.swapchain.as_ref().unwrap();
-            let swapchains = [sc.swapchain];
-            let indices = [index];
-            let present = vk::PresentInfoKHR::default()
-                .wait_semaphores(&signal)
-                .swapchains(&swapchains)
-                .image_indices(&indices);
-            sc.swapchain_loader.queue_present(self.queue, &present)?;
+            profile_vk_call("render_queue_submit", || {
+                self.device
+                    .queue_submit(self.queue, &[submit], self.in_flight)
+            })?;
+            // The recorded initialization only becomes effective after submit.
+            self.swapchain.as_mut().unwrap().targets_initialized = true;
 
             // Wait so the readback pixel is valid (and single-frame-in-flight).
-            self.device
-                .wait_for_fences(&[self.in_flight], true, u64::MAX)?;
+            profile_vk_call("render_fence_wait", || {
+                self.device
+                    .wait_for_fences(&[self.in_flight], true, u64::MAX)
+            })?;
+            // The render submission waited on every batch semaphore, so its
+            // fence proves the staging resources are no longer in use.
+            destroy_submitted_uploads(&self.device, self.command_pool, &mut self.submitted_uploads);
             // The frame that referenced any textures retired during recording is
             // now complete on the GPU; it's safe to destroy them.
             for old in std::mem::take(&mut self.retired_textures) {
@@ -1434,6 +1990,18 @@ impl Backend {
                 }
                 self.last_capture = Some((self.frame_num, extent.width, extent.height, rgba));
             }
+
+            let sc = self.swapchain.as_ref().unwrap();
+            let swapchains = [sc.swapchain];
+            let indices = [index];
+            let present = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal)
+                .swapchains(&swapchains)
+                .image_indices(&indices);
+            self.frame_pacer.wait();
+            profile_vk_call("queue_present", || {
+                sc.swapchain_loader.queue_present(self.queue, &present)
+            })?;
         }
         self.frame_num += 1;
         Ok(())
@@ -1501,10 +2069,10 @@ impl Backend {
         // change as OUT_OF_DATE, so compare the surface extent ourselves.
         if let Some(sc) = self.swapchain.as_ref() {
             // SAFETY: valid physical device and surface owned by `sc`.
-            let caps = unsafe {
+            let caps = profile_vk_call("surface_capabilities", || unsafe {
                 sc.surface_loader
-                    .get_physical_device_surface_capabilities(self.physical, sc.surface)?
-            };
+                    .get_physical_device_surface_capabilities(self.physical, sc.surface)
+            })?;
             let cur = caps.current_extent;
             if cur.width != u32::MAX
                 && cur.width > 0
@@ -1515,21 +2083,25 @@ impl Backend {
             }
         }
         let index;
-        let sc = self.swapchain.as_ref().unwrap();
+        let sc = self.swapchain.as_mut().unwrap();
         // SAFETY: owned handles; single-frame-in-flight enforced by the fence.
         unsafe {
             // Wait for the previous frame; the fence is reset just before submit
             // in `present_inner`, so an out-of-date acquire here leaves it
             // signaled (no hang) and the swapchain gets recreated.
-            self.device
-                .wait_for_fences(&[self.in_flight], true, u64::MAX)?;
+            profile_vk_call("previous_frame_fence_wait", || {
+                self.device
+                    .wait_for_fences(&[self.in_flight], true, u64::MAX)
+            })?;
 
-            let (idx, _) = sc.swapchain_loader.acquire_next_image(
-                sc.swapchain,
-                u64::MAX,
-                self.image_available,
-                vk::Fence::null(),
-            )?;
+            let (idx, _) = profile_vk_call("acquire_next_image", || {
+                sc.swapchain_loader.acquire_next_image(
+                    sc.swapchain,
+                    u64::MAX,
+                    self.image_available,
+                    vk::Fence::null(),
+                )
+            })?;
             index = idx;
 
             self.device
@@ -1538,6 +2110,103 @@ impl Backend {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device
                 .begin_command_buffer(self.command_buffer, &begin)?;
+
+            if !sc.targets_initialized {
+                let color_range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let depth_range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let barriers = [
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(sc.color_image)
+                        .subresource_range(color_range),
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(self.depth_image)
+                        .subresource_range(depth_range),
+                ];
+                self.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+                self.device.cmd_clear_color_image(
+                    self.command_buffer,
+                    sc.color_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                    &[color_range],
+                );
+                self.device.cmd_clear_depth_stencil_image(
+                    self.command_buffer,
+                    self.depth_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                    &[depth_range],
+                );
+                let barriers = [
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(sc.color_image)
+                        .subresource_range(color_range),
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        )
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(self.depth_image)
+                        .subresource_range(depth_range),
+                ];
+                self.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+            }
 
             let clears = [
                 vk::ClearValue {
@@ -1554,7 +2223,7 @@ impl Backend {
             ];
             let rp_begin = vk::RenderPassBeginInfo::default()
                 .render_pass(self.render_pass)
-                .framebuffer(sc.framebuffers[index as usize])
+                .framebuffer(sc.framebuffer)
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
                     extent: sc.extent,
@@ -1582,6 +2251,9 @@ impl Backend {
                 .cmd_set_viewport(self.command_buffer, 0, &[viewport]);
             self.device
                 .cmd_set_scissor(self.command_buffer, 0, &[scissor]);
+            // The next draw applies any Glide clip window, including one saved
+            // before this frame or before a swapchain resize.
+            self.scissor_dirty = true;
             self.device.cmd_bind_vertex_buffers(
                 self.command_buffer,
                 0,
@@ -1594,6 +2266,7 @@ impl Backend {
         }
         self.current_image = Some(index);
         self.vertex_count = 0;
+        self.vertices.clear();
         Ok(())
     }
 }
@@ -1603,12 +2276,15 @@ impl Drop for Backend {
         // SAFETY: destroy in reverse creation order after the device is idle.
         unsafe {
             let _ = self.device.device_wait_idle();
+            destroy_pending_uploads(&self.device, self.command_pool, &mut self.pending_uploads);
+            destroy_submitted_uploads(&self.device, self.command_pool, &mut self.submitted_uploads);
             if let Some(sc) = &self.swapchain {
-                for &fb in &sc.framebuffers {
-                    self.device.destroy_framebuffer(fb, None);
-                }
-                for &view in &sc.image_views {
-                    self.device.destroy_image_view(view, None);
+                self.device.destroy_framebuffer(sc.framebuffer, None);
+                self.device.destroy_image_view(sc.color_view, None);
+                self.device.destroy_image(sc.color_image, None);
+                self.device.free_memory(sc.color_memory, None);
+                for &semaphore in &sc.render_finished {
+                    self.device.destroy_semaphore(semaphore, None);
                 }
                 sc.swapchain_loader.destroy_swapchain(sc.swapchain, None);
                 sc.surface_loader.destroy_surface(sc.surface, None);
@@ -1650,7 +2326,6 @@ impl Drop for Backend {
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_sampler(self.sampler_clamp, None);
             self.device.destroy_semaphore(self.image_available, None);
-            self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
@@ -1712,6 +2387,14 @@ fn create_swapchain(
     // SAFETY: handles are valid and owned by the caller for this scope.
     let caps =
         unsafe { surface_loader.get_physical_device_surface_capabilities(physical, surface)? };
+    if !caps
+        .supported_usage_flags
+        .contains(vk::ImageUsageFlags::TRANSFER_DST)
+    {
+        return Err(Error::Loading(
+            "swapchain surface cannot receive framebuffer copies".into(),
+        ));
+    }
     let formats = unsafe { surface_loader.get_physical_device_surface_formats(physical, surface)? };
     // An invalid/being-destroyed surface (e.g. during a focus-loss teardown) can
     // report no formats; bail cleanly instead of indexing `formats[0]`.
@@ -1752,8 +2435,7 @@ fn create_swapchain(
         .image_color_space(format.color_space)
         .image_extent(extent)
         .image_array_layers(1)
-        // COLOR_ATTACHMENT to render into; TRANSFER_SRC for the center readback.
-        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+        .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
         .pre_transform(caps.current_transform)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -1763,7 +2445,28 @@ fn create_swapchain(
     let swapchain_loader = ash::khr::swapchain::Device::new(instance, device);
     // SAFETY: `info` references live handles; loader belongs to instance/device.
     let swapchain = unsafe { swapchain_loader.create_swapchain(&info, None)? };
-    let images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+    let images = match unsafe { swapchain_loader.get_swapchain_images(swapchain) } {
+        Ok(images) => images,
+        Err(error) => {
+            unsafe { swapchain_loader.destroy_swapchain(swapchain, None) };
+            return Err(error.into());
+        }
+    };
+    let mut render_finished = Vec::with_capacity(images.len());
+    for _ in &images {
+        match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+            Ok(semaphore) => render_finished.push(semaphore),
+            Err(error) => {
+                unsafe {
+                    for semaphore in render_finished {
+                        device.destroy_semaphore(semaphore, None);
+                    }
+                    swapchain_loader.destroy_swapchain(swapchain, None);
+                }
+                return Err(error.into());
+            }
+        }
+    }
 
     Ok(Swapchain {
         surface_loader,
@@ -1773,8 +2476,12 @@ fn create_swapchain(
         format: format.format,
         extent,
         images,
-        image_views: Vec::new(),
-        framebuffers: Vec::new(),
+        render_finished,
+        color_image: vk::Image::null(),
+        color_memory: vk::DeviceMemory::null(),
+        color_view: vk::ImageView::null(),
+        framebuffer: vk::Framebuffer::null(),
+        targets_initialized: false,
     })
 }
 
@@ -1782,21 +2489,21 @@ fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::Re
     let color = vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(vk::AttachmentLoadOp::LOAD)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .initial_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         // Leave the image ready for the center-pixel copy after the pass.
         .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
     let depth = vk::AttachmentDescription::default()
         .format(DEPTH_FORMAT)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     let color_ref = vk::AttachmentReference::default()
         .attachment(0)
@@ -1813,21 +2520,43 @@ fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::Re
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
         .src_stage_mask(
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            vk::PipelineStageFlags::TRANSFER
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
         )
         .dst_stage_mask(
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
         )
-        .src_access_mask(vk::AccessFlags::empty())
+        .src_access_mask(
+            vk::AccessFlags::TRANSFER_READ
+                | vk::AccessFlags::TRANSFER_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
         .dst_access_mask(
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            vk::AccessFlags::COLOR_ATTACHMENT_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
                 | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
         );
     let attachments = [color, depth];
     let subpasses = [subpass];
-    let dependencies = [dependency];
+    let to_transfer = vk::SubpassDependency::default()
+        .src_subpass(0)
+        .dst_subpass(vk::SUBPASS_EXTERNAL)
+        .src_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
+        .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+        .src_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    let dependencies = [dependency, to_transfer];
     let info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
         .subpasses(&subpasses)
@@ -1837,35 +2566,89 @@ fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::Re
 }
 
 fn create_framebuffers(
+    instance: &ash::Instance,
     device: &ash::Device,
+    physical: vk::PhysicalDevice,
     render_pass: vk::RenderPass,
     depth_view: vk::ImageView,
     sc: &mut Swapchain,
 ) -> Result<(), Error> {
-    for &image in &sc.images {
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
+    unsafe {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
             .format(sc.format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        // SAFETY: `image` is a live swapchain image; `sc.format` matches it.
-        let view = unsafe { device.create_image_view(&view_info, None)? };
-        let attachments = [view, depth_view];
-        let fb_info = vk::FramebufferCreateInfo::default()
-            .render_pass(render_pass)
-            .attachments(&attachments)
-            .width(sc.extent.width)
-            .height(sc.extent.height)
-            .layers(1);
-        let fb = unsafe { device.create_framebuffer(&fb_info, None)? };
-        sc.image_views.push(view);
-        sc.framebuffers.push(fb);
+            .extent(vk::Extent3D {
+                width: sc.extent.width,
+                height: sc.extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = device.create_image(&info, None)?;
+        let mut memory = vk::DeviceMemory::null();
+        let mut view = vk::ImageView::null();
+        let result: Result<vk::Framebuffer, Error> = (|| {
+            let req = device.get_image_memory_requirements(image);
+            let memory_type = find_memory_type(
+                instance,
+                physical,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            memory = device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(memory_type),
+                None,
+            )?;
+            device.bind_image_memory(image, memory, 0)?;
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(sc.format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            view = device.create_image_view(&view_info, None)?;
+            let attachments = [view, depth_view];
+            let fb_info = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass)
+                .attachments(&attachments)
+                .width(sc.extent.width)
+                .height(sc.extent.height)
+                .layers(1);
+            Ok(device.create_framebuffer(&fb_info, None)?)
+        })();
+        let fb = match result {
+            Ok(fb) => fb,
+            Err(error) => {
+                if view != vk::ImageView::null() {
+                    device.destroy_image_view(view, None);
+                }
+                device.destroy_image(image, None);
+                if memory != vk::DeviceMemory::null() {
+                    device.free_memory(memory, None);
+                }
+                return Err(error);
+            }
+        };
+        sc.color_image = image;
+        sc.color_memory = memory;
+        sc.color_view = view;
+        sc.framebuffer = fb;
     }
     Ok(())
 }
@@ -1889,7 +2672,7 @@ unsafe fn create_depth_buffer(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = device.create_image(&info, None)?;
@@ -2032,7 +2815,7 @@ fn build_pipeline(
         .scissor_count(1);
     // GLIDEVK_WIREFRAME renders geometry as outlines — a debug aid for seeing
     // what is drawn regardless of its (possibly invisible) shading.
-    let polygon_mode = if std::env::var_os("GLIDEVK_WIREFRAME").is_some() {
+    let polygon_mode = if key.wireframe {
         vk::PolygonMode::LINE
     } else {
         vk::PolygonMode::FILL
@@ -2106,6 +2889,53 @@ enum HostAccess {
     Readback,
 }
 
+/// Time individual Vulkan calls only in explicitly enabled profiling mode.
+/// Keep file writes bounded so diagnostics do not become the bottleneck.
+fn profile_vk_call<T>(name: &'static str, call: impl FnOnce() -> T) -> T {
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        OnceLock,
+    };
+    use std::time::{Duration, Instant};
+    static LOG_PATH: OnceLock<Option<String>> = OnceLock::new();
+    static LINES: AtomicU32 = AtomicU32::new(0);
+    static DRAW_LINES: AtomicU32 = AtomicU32::new(0);
+    let path = LOG_PATH.get_or_init(|| {
+        std::env::var_os("GLIDEVK_PROFILE_ONLY")?;
+        std::env::var("GLIDEVK_LOG").ok().map(|value| {
+            if value.is_empty() || value == "1" {
+                "glidevk.log".to_owned()
+            } else {
+                value
+            }
+        })
+    });
+    let Some(path) = path else { return call() };
+    let start = Instant::now();
+    let result = call();
+    let elapsed = start.elapsed();
+    let counter = if name.starts_with("draw_") {
+        &DRAW_LINES
+    } else {
+        &LINES
+    };
+    if elapsed >= Duration::from_millis(50) && counter.fetch_add(1, Ordering::Relaxed) < 40 {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                file,
+                "vk slow {name}: {:.1}ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    }
+    result
+}
+
 /// Allocate a host-visible, coherent buffer and leave it persistently mapped.
 unsafe fn create_mapped_buffer(
     instance: &ash::Instance,
@@ -2119,9 +2949,13 @@ unsafe fn create_mapped_buffer(
         .size(size)
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer = device.create_buffer(&info, None)?;
-    let req = device.get_buffer_memory_requirements(buffer);
-    let props = instance.get_physical_device_memory_properties(physical);
+    let buffer = profile_vk_call("create_buffer", || device.create_buffer(&info, None))?;
+    let req = profile_vk_call("get_buffer_memory_requirements", || {
+        device.get_buffer_memory_requirements(buffer)
+    });
+    let props = profile_vk_call("get_physical_device_memory_properties", || {
+        instance.get_physical_device_memory_properties(physical)
+    });
     let base = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     let find = |want: vk::MemoryPropertyFlags| {
         (0..props.memory_type_count).find(|&i| {
@@ -2139,10 +2973,69 @@ unsafe fn create_mapped_buffer(
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
         .memory_type_index(mem_type);
-    let memory = device.allocate_memory(&alloc, None)?;
-    device.bind_buffer_memory(buffer, memory, 0)?;
-    let ptr = device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())? as *mut u8;
+    let memory = profile_vk_call("allocate_buffer_memory", || {
+        device.allocate_memory(&alloc, None)
+    })?;
+    profile_vk_call("bind_buffer_memory", || {
+        device.bind_buffer_memory(buffer, memory, 0)
+    })?;
+    let ptr = profile_vk_call("map_buffer_memory", || {
+        device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
+    })? as *mut u8;
     Ok((buffer, memory, ptr))
+}
+
+/// Allocate an unmapped intermediate buffer for vkCmdUpdateBuffer uploads.
+unsafe fn create_upload_buffer(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical: vk::PhysicalDevice,
+    size: u64,
+) -> Result<(vk::Buffer, vk::DeviceMemory), Error> {
+    let info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = device.create_buffer(&info, None)?;
+    let result = (|| {
+        let req = device.get_buffer_memory_requirements(buffer);
+        let mem_type = find_memory_type(
+            instance,
+            physical,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|_| {
+            find_memory_type(
+                instance,
+                physical,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+            )
+        })?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        let memory = device.allocate_memory(&alloc, None)?;
+        if let Err(error) = device.bind_buffer_memory(buffer, memory, 0) {
+            device.free_memory(memory, None);
+            return Err(error.into());
+        }
+        Ok(memory)
+    })();
+    match result {
+        Ok(memory) => Ok((buffer, memory)),
+        Err(error) => {
+            device.destroy_buffer(buffer, None);
+            Err(error)
+        }
+    }
+}
+
+/// Vulkan limits a single vkCmdUpdateBuffer to 65536 bytes and requires its
+/// size to be a multiple of four. Never use it for an incomplete source.
+fn use_command_update(size: u64, source_len: usize) -> bool {
+    size > 0 && size <= 65_536 && size.is_multiple_of(4) && source_len as u64 >= size
 }
 
 /// A TRANSFER-stage image layout transition (used between copy operations).
@@ -2287,22 +3180,22 @@ unsafe fn create_desc_pool(device: &ash::Device) -> Result<vk::DescriptorPool, E
     Ok(device.create_descriptor_pool(&info, None)?)
 }
 
-/// Copy `rgba` into `image` through a staging buffer, leaving it in
+/// Record a copy of `rgba` into `image`, leaving it in
 /// SHADER_READ_ONLY_OPTIMAL. `old_layout` is UNDEFINED for a fresh image or
 /// SHADER_READ_ONLY_OPTIMAL when overwriting one already in use.
 #[allow(clippy::too_many_arguments)]
-unsafe fn upload_image_pixels(
+unsafe fn record_image_upload(
     instance: &ash::Instance,
     device: &ash::Device,
     physical: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
-    queue: vk::Queue,
     image: vk::Image,
     width: u32,
     height: u32,
     rgba: &[u8],
     old_layout: vk::ImageLayout,
-) -> Result<(), Error> {
+    addr: Option<u64>,
+) -> Result<PendingUpload, Error> {
     let extent = vk::Extent3D {
         width,
         height,
@@ -2316,27 +3209,79 @@ unsafe fn upload_image_pixels(
         layer_count: 1,
     };
     let staging_size = (width as u64) * (height as u64) * 4;
-    let (staging, staging_mem, staging_ptr) = create_mapped_buffer(
-        instance,
-        device,
-        physical,
-        staging_size.max(4),
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        HostAccess::Upload,
-    )?;
-    let n = rgba.len().min(staging_size as usize);
-    std::ptr::copy_nonoverlapping(rgba.as_ptr(), staging_ptr, n);
+    let inline = use_command_update(staging_size, rgba.len()) && rgba.as_ptr().align_offset(4) == 0;
+    let (staging, staging_mem) = if inline {
+        profile_vk_call("staging_buffer_total", || {
+            create_upload_buffer(instance, device, physical, staging_size)
+        })?
+    } else {
+        let (staging, memory, ptr) = profile_vk_call("staging_buffer_total", || {
+            create_mapped_buffer(
+                instance,
+                device,
+                physical,
+                staging_size.max(4),
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                HostAccess::Upload,
+            )
+        })?;
+        let n = rgba.len().min(staging_size as usize);
+        profile_vk_call("staging_copy", || {
+            std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr, n)
+        });
+        (staging, memory)
+    };
 
-    let cmd = device.allocate_command_buffers(
-        &vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1),
-    )?[0];
-    device.begin_command_buffer(
-        cmd,
-        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-    )?;
+    let allocated = profile_vk_call("allocate_upload_command_buffer", || {
+        device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    });
+    let cmd = match allocated {
+        Ok(commands) => commands[0],
+        Err(error) => {
+            device.destroy_buffer(staging, None);
+            device.free_memory(staging_mem, None);
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = profile_vk_call("begin_upload_command_buffer", || {
+        device.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+    }) {
+        device.free_command_buffers(command_pool, &[cmd]);
+        device.destroy_buffer(staging, None);
+        device.free_memory(staging_mem, None);
+        return Err(error.into());
+    }
+    if inline {
+        profile_vk_call("upload_command_update", || {
+            device.cmd_update_buffer(cmd, staging, 0, &rgba[..staging_size as usize]);
+        });
+        let barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(staging)
+            .offset(0)
+            .size(staging_size);
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[barrier],
+            &[],
+        );
+    }
     let src_access = if old_layout == vk::ImageLayout::UNDEFINED {
         vk::AccessFlags::empty()
     } else {
@@ -2356,15 +3301,17 @@ unsafe fn upload_image_pixels(
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(range);
-    device.cmd_pipeline_barrier(
-        cmd,
-        src_stage,
-        vk::PipelineStageFlags::TRANSFER,
-        vk::DependencyFlags::empty(),
-        &[],
-        &[],
-        &[to_dst],
-    );
+    profile_vk_call("upload_barrier_to_dst", || {
+        device.cmd_pipeline_barrier(
+            cmd,
+            src_stage,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_dst],
+        )
+    });
     let region = vk::BufferImageCopy {
         buffer_offset: 0,
         buffer_row_length: 0,
@@ -2378,13 +3325,15 @@ unsafe fn upload_image_pixels(
         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
         image_extent: extent,
     };
-    device.cmd_copy_buffer_to_image(
-        cmd,
-        staging,
-        image,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        &[region],
-    );
+    profile_vk_call("upload_copy_buffer_to_image", || {
+        device.cmd_copy_buffer_to_image(
+            cmd,
+            staging,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        )
+    });
     let to_read = vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -2394,24 +3343,96 @@ unsafe fn upload_image_pixels(
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(range);
-    device.cmd_pipeline_barrier(
-        cmd,
-        vk::PipelineStageFlags::TRANSFER,
-        vk::PipelineStageFlags::FRAGMENT_SHADER,
-        vk::DependencyFlags::empty(),
-        &[],
-        &[],
-        &[to_read],
-    );
-    device.end_command_buffer(cmd)?;
-    let cmds = [cmd];
-    let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-    device.queue_submit(queue, &[submit], vk::Fence::null())?;
+    profile_vk_call("upload_barrier_to_read", || {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_read],
+        )
+    });
+    if let Err(error) = profile_vk_call("end_upload_command_buffer", || {
+        device.end_command_buffer(cmd)
+    }) {
+        device.free_command_buffers(command_pool, &[cmd]);
+        device.destroy_buffer(staging, None);
+        device.free_memory(staging_mem, None);
+        return Err(error.into());
+    }
+    Ok(PendingUpload {
+        addr,
+        command_buffer: cmd,
+        staging_buffer: staging,
+        staging_memory: staging_mem,
+    })
+}
+
+/// Synchronous upload for headless backends, which do not have a later render
+/// submission to batch with the texture transfer.
+#[allow(clippy::too_many_arguments)]
+unsafe fn upload_image_pixels_sync(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    old_layout: vk::ImageLayout,
+) -> Result<(), Error> {
+    let upload = record_image_upload(
+        instance,
+        device,
+        physical,
+        command_pool,
+        image,
+        width,
+        height,
+        rgba,
+        old_layout,
+        None,
+    )?;
+    let commands = [upload.command_buffer];
+    let submit = vk::SubmitInfo::default().command_buffers(&commands);
+    if let Err(error) = device.queue_submit(queue, &[submit], vk::Fence::null()) {
+        let mut uploads = vec![upload];
+        destroy_pending_uploads(device, command_pool, &mut uploads);
+        return Err(error.into());
+    }
     device.queue_wait_idle(queue)?;
-    device.free_command_buffers(command_pool, &cmds);
-    device.destroy_buffer(staging, None);
-    device.free_memory(staging_mem, None);
+    let mut uploads = vec![upload];
+    destroy_pending_uploads(device, command_pool, &mut uploads);
     Ok(())
+}
+
+fn destroy_pending_uploads(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    uploads: &mut Vec<PendingUpload>,
+) {
+    unsafe {
+        for upload in uploads.drain(..) {
+            device.free_command_buffers(command_pool, &[upload.command_buffer]);
+            device.destroy_buffer(upload.staging_buffer, None);
+            device.free_memory(upload.staging_memory, None);
+        }
+    }
+}
+
+fn destroy_submitted_uploads(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    uploads: &mut Vec<SubmittedUploadBatch>,
+) {
+    for mut batch in uploads.drain(..) {
+        destroy_pending_uploads(device, command_pool, &mut batch.uploads);
+        unsafe { device.destroy_semaphore(batch.ready, None) };
+    }
 }
 
 /// Upload an RGBA8 texture to a device-local image and build its descriptor set.
@@ -2430,7 +3451,9 @@ unsafe fn create_gpu_texture(
     height: u32,
     rgba: &[u8],
     used_frame: u32,
-) -> Result<GpuTexture, Error> {
+    defer_upload: bool,
+    addr: Option<u64>,
+) -> Result<(GpuTexture, Option<PendingUpload>), Error> {
     let format = vk::Format::R8G8B8A8_UNORM;
     let extent = vk::Extent3D {
         width,
@@ -2448,32 +3471,58 @@ unsafe fn create_gpu_texture(
         .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
-    let image = device.create_image(&image_info, None)?;
-    let req = device.get_image_memory_requirements(image);
-    let mem_type = find_memory_type(
-        instance,
-        physical,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
+    let image = profile_vk_call("create_image", || device.create_image(&image_info, None))?;
+    let req = profile_vk_call("get_image_memory_requirements", || {
+        device.get_image_memory_requirements(image)
+    });
+    let mem_type = profile_vk_call("find_image_memory_type", || {
+        find_memory_type(
+            instance,
+            physical,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+    })?;
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
         .memory_type_index(mem_type);
-    let memory = device.allocate_memory(&alloc, None)?;
-    device.bind_image_memory(image, memory, 0)?;
+    let memory = profile_vk_call("allocate_image_memory", || {
+        device.allocate_memory(&alloc, None)
+    })?;
+    profile_vk_call("bind_image_memory", || {
+        device.bind_image_memory(image, memory, 0)
+    })?;
 
-    upload_image_pixels(
-        instance,
-        device,
-        physical,
-        command_pool,
-        queue,
-        image,
-        width,
-        height,
-        rgba,
-        vk::ImageLayout::UNDEFINED,
-    )?;
+    let pending_upload = if defer_upload {
+        Some(profile_vk_call("record_image_upload_total", || {
+            record_image_upload(
+                instance,
+                device,
+                physical,
+                command_pool,
+                image,
+                width,
+                height,
+                rgba,
+                vk::ImageLayout::UNDEFINED,
+                addr,
+            )
+        })?)
+    } else {
+        upload_image_pixels_sync(
+            instance,
+            device,
+            physical,
+            command_pool,
+            queue,
+            image,
+            width,
+            height,
+            rgba,
+            vk::ImageLayout::UNDEFINED,
+        )?;
+        None
+    };
 
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -2489,16 +3538,20 @@ unsafe fn create_gpu_texture(
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
         .subresource_range(range);
-    let view = device.create_image_view(&view_info, None)?;
+    let view = profile_vk_call("create_image_view", || {
+        device.create_image_view(&view_info, None)
+    })?;
 
     // One descriptor per sampler (REPEAT + CLAMP), so a draw can pick the
     // address mode the game requested via grTexClampMode.
     let layouts = [desc_set_layout, desc_set_layout];
-    let sets = device.allocate_descriptor_sets(
-        &vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(desc_pool)
-            .set_layouts(&layouts),
-    )?;
+    let sets = profile_vk_call("allocate_descriptor_sets", || {
+        device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(desc_pool)
+                .set_layouts(&layouts),
+        )
+    })?;
     let (descriptor, descriptor_clamp) = (sets[0], sets[1]);
     for (set, samp) in [(descriptor, sampler), (descriptor_clamp, sampler_clamp)] {
         let image_info = vk::DescriptorImageInfo::default()
@@ -2511,24 +3564,158 @@ unsafe fn create_gpu_texture(
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_infos);
-        device.update_descriptor_sets(&[write], &[]);
+        profile_vk_call("update_descriptor_sets", || {
+            device.update_descriptor_sets(&[write], &[])
+        });
     }
 
-    Ok(GpuTexture {
-        image,
-        memory,
-        view,
-        descriptor,
-        descriptor_clamp,
-        width,
-        height,
-        used_frame,
-    })
+    Ok((
+        GpuTexture {
+            image,
+            memory,
+            view,
+            descriptor,
+            descriptor_clamp,
+            width,
+            height,
+            used_frame,
+        },
+        pending_upload,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_respects_color_and_depth_write_masks() {
+        assert!(clear_aspects(false, false, false).is_empty());
+        assert!(clear_aspects(false, false, true) == vk::ImageAspectFlags::DEPTH);
+        assert!(clear_aspects(true, false, false) == vk::ImageAspectFlags::COLOR);
+        assert!(
+            clear_aspects(false, true, true)
+                == vk::ImageAspectFlags::COLOR | vk::ImageAspectFlags::DEPTH
+        );
+        assert_eq!(clear_color_write_mask(true, false), 7);
+        assert_eq!(clear_color_write_mask(false, true), 8);
+        assert_eq!(clear_color_write_mask(true, true), 15);
+    }
+
+    #[test]
+    fn clip_scissor_scales_edges_and_obeys_origin() {
+        let extent = vk::Extent2D {
+            width: 1280,
+            height: 960,
+        };
+        let full = clip_scissor(None, (640, 480), extent, false);
+        assert_eq!(
+            (
+                full.offset.x,
+                full.offset.y,
+                full.extent.width,
+                full.extent.height
+            ),
+            (0, 0, 1280, 960)
+        );
+        let top_left = clip_scissor(Some([10, 20, 110, 120]), (640, 480), extent, false);
+        assert_eq!(
+            (
+                top_left.offset.x,
+                top_left.offset.y,
+                top_left.extent.width,
+                top_left.extent.height
+            ),
+            (20, 40, 200, 200)
+        );
+        let bottom_left = clip_scissor(Some([10, 20, 110, 120]), (640, 480), extent, true);
+        assert_eq!(
+            (
+                bottom_left.offset.x,
+                bottom_left.offset.y,
+                bottom_left.extent.width,
+                bottom_left.extent.height
+            ),
+            (20, 720, 200, 200)
+        );
+        let empty = clip_scissor(Some([2, 4, 2, 4]), (640, 480), extent, false);
+        assert_eq!((empty.extent.width, empty.extent.height), (0, 0));
+        let scaled = clip_scissor(
+            Some([1, 1, 3, 3]),
+            (4, 4),
+            vk::Extent2D {
+                width: 6,
+                height: 6,
+            },
+            false,
+        );
+        assert_eq!(
+            (
+                scaled.offset.x,
+                scaled.offset.y,
+                scaled.extent.width,
+                scaled.extent.height
+            ),
+            (1, 1, 3, 3)
+        );
+    }
+
+    #[test]
+    fn vertex_upload_chunks_cover_frame_in_aligned_vulkan_updates() {
+        let vertices = vec![DrawVertex::default(); 2_000];
+        let chunks: Vec<_> = vertex_upload_chunks(&vertices).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!((chunks[0].0, chunks[0].1.len()), (0, 65_536));
+        assert_eq!((chunks[1].0, chunks[1].1.len()), (65_536, 14_464));
+        assert!(chunks
+            .iter()
+            .all(|(offset, bytes)| offset % 4 == 0 && bytes.len() % 4 == 0));
+        assert_eq!(vertex_upload_chunks(&[]).count(), 0);
+    }
+
+    #[test]
+    fn command_update_obeys_vulkan_size_limits_and_requires_full_input() {
+        assert!(use_command_update(4, 4));
+        assert!(use_command_update(65_536, 65_536));
+        assert!(!use_command_update(0, 0));
+        assert!(!use_command_update(3, 3));
+        assert!(!use_command_update(65_540, 65_540));
+        assert!(!use_command_update(4096, 4095));
+    }
+
+    #[test]
+    fn persistent_texture_binding_counts_as_used_in_new_frame() {
+        let texture = GpuTexture {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            descriptor: vk::DescriptorSet::null(),
+            descriptor_clamp: vk::DescriptorSet::null(),
+            width: 16,
+            height: 16,
+            used_frame: 4,
+        };
+        let mut textures = HashMap::from([(42, texture)]);
+        // The game draws with a binding carried over from the previous frame,
+        // then re-downloads it: in-place overwrite must no longer be allowed.
+        mark_texture_drawn(&mut textures, Some(42), 5);
+        assert_eq!(textures[&42].used_frame, 5);
+        mark_texture_drawn(&mut textures, None, 6);
+        assert_eq!(textures[&42].used_frame, 5);
+    }
+
+    #[test]
+    fn alpha_blending_is_not_disabled_by_opaque_rgb_factors() {
+        use crate::types::BlendFactor;
+        let mut state = crate::state::State::default();
+        assert!(!BlendConfig::from_state(&state).enable);
+        state.blend_dst_alpha = BlendFactor::One;
+        let blend = BlendConfig::from_state(&state);
+        assert!(blend.enable);
+        assert_eq!(blend.src_rgb, BlendFactor::One as i32);
+        assert_eq!(blend.dst_rgb, BlendFactor::Zero as i32);
+        assert_eq!(blend.dst_alpha, BlendFactor::One as i32);
+    }
 
     #[test]
     fn capture_is_off_by_default_and_decodes_the_frame_argument() {
@@ -2549,8 +3736,12 @@ mod tests {
     #[test]
     fn headless_brings_up_a_device() {
         match Backend::new_headless() {
-            Ok(b) => {
+            Ok(mut b) => {
                 assert!(!b.device_name().is_empty());
+                // Exercise command-update staging and the larger mapped fallback.
+                b.upload_texture(1, 2, 2, &[255; 16]).unwrap();
+                b.upload_texture(2, 256, 256, &vec![255; 256 * 256 * 4])
+                    .unwrap();
                 eprintln!("GlideVK headless device: {}", b.device_name());
             }
             Err(e) => eprintln!("skipping: no usable Vulkan on host ({e:?})"),

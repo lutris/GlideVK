@@ -24,18 +24,30 @@ use glidevk_core::Context;
 static CONTEXT: Mutex<Option<Context>> = Mutex::new(None);
 /// Frame counter (bumped each `grBufferSwap`) for frame-gated debug logging.
 static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// HWND backing the Vulkan surface when Glide's fullscreen API supplies NULL.
+/// The Boolean records whether GlideVK created the window itself.
+#[cfg(windows)]
+static LAST_GLIDE_HWND: Mutex<Option<(isize, bool)>> = Mutex::new(None);
+/// HWND to which the persistent backend's Vulkan surface is actually bound.
+#[cfg(windows)]
+static BACKEND_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+#[cfg(windows)]
+static WINDOWED_RESTORE: Mutex<Option<glidevk_core::win32::WindowedWindowState>> = Mutex::new(None);
 
-/// Append a diagnostic line to the log when `GLIDEVK_LOG` is set. Its value is
-/// the log path; `GLIDEVK_LOG=1` uses the fixed absolute `C:\glidevk.log` (which
-/// Wine maps to `$WINEPREFIX/drive_c/glidevk.log`) so the location doesn't depend
-/// on the game's working directory. A no-op when unset.
-/// `GLIDEVK_WINDOWED=1`: keep the desktop mode and render into the game's
-/// window as-is instead of switching the display to the Glide resolution.
+/// `GLIDEVK_WINDOWED=1`: keep the desktop mode and make the game window
+/// movable without changing its client size.
 #[cfg(windows)]
 fn windowed() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GLIDEVK_WINDOWED").is_some())
+    *ON.get_or_init(|| {
+        std::env::var_os("GLIDEVK_WINDOWED")
+            .map(|value| {
+                let value = value.to_string_lossy();
+                !value.is_empty() && value != "0"
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Glide is fullscreen-only: switch the display to the requested mode like a
@@ -46,16 +58,128 @@ fn windowed() -> bool {
 #[cfg(windows)]
 fn enter_display_mode(hwnd: usize, w: u32, h: u32) {
     if windowed() {
+        let (old, already_saved) = match WINDOWED_RESTORE.lock() {
+            Ok(mut state) => {
+                let old = if state
+                    .as_ref()
+                    .is_some_and(|saved| saved.hwnd() != hwnd as isize)
+                {
+                    state.take()
+                } else {
+                    None
+                };
+                (old, state.is_some())
+            }
+            Err(_) => {
+                glidevk_log("GLIDEVK_WINDOWED: window-state lock failed");
+                return;
+            }
+        };
+        if let Some(old) = old {
+            let _ = glidevk_core::win32::restore_windowed_window(old);
+        }
+        match glidevk_core::win32::make_windowed_window(hwnd as isize) {
+            Ok(Some(original)) => {
+                if !already_saved {
+                    if let Ok(mut state) = WINDOWED_RESTORE.lock() {
+                        *state = Some(original);
+                    }
+                }
+                glidevk_log(&format!(
+                    "GLIDEVK_WINDOWED=1: added window decorations (hwnd={hwnd:#x}, logical={w}x{h})"
+                ));
+            }
+            Ok(None) => glidevk_log(&format!(
+                "GLIDEVK_WINDOWED=1: window already decorated (hwnd={hwnd:#x}, logical={w}x{h})"
+            )),
+            Err(code) => glidevk_log(&format!(
+                "GLIDEVK_WINDOWED=1: could not decorate hwnd={hwnd:#x} (Win32 error {code})"
+            )),
+        }
+        match glidevk_core::win32::resize_window_client(hwnd as isize, w, h) {
+            Ok(()) => {
+                let actual = glidevk_core::win32::window_info(hwnd as isize);
+                glidevk_log(&format!(
+                    "GLIDEVK_WINDOWED: requested client={w}x{h}, actual={actual:?}"
+                ));
+            }
+            Err(code) => glidevk_log(&format!(
+                "GLIDEVK_WINDOWED: could not resize hwnd={hwnd:#x} (Win32 error {code})"
+            )),
+        }
         return;
     }
     match glidevk_core::win32::set_display_mode(w, h) {
         Ok(()) => {
-            glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
-            glidevk_log(&format!("display mode {w}x{h} set, window sized to match"));
+            let actual = glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
+            glidevk_log(&format!(
+                "display mode {w}x{h} set, fullscreen window={actual:?}"
+            ));
         }
-        Err(code) => glidevk_log(&format!(
-            "display mode {w}x{h} FAILED (DISP_CHANGE {code}); staying windowed"
-        )),
+        Err(code) => {
+            // Wine frequently rejects legacy modes such as 1600x1200 on macOS
+            // (DISP_CHANGE_BADMODE). The game may still have its initial
+            // 640x480 window, so retaining it produces a black square in the
+            // upper-left corner. Cover the current monitor instead and keep the
+            // requested mode as Glide's logical coordinate space; Vulkan scales
+            // that space to the surface.
+            let actual = glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
+            glidevk_log(&format!(
+                "display mode {w}x{h} FAILED (DISP_CHANGE {code}); \
+                 borderless monitor fallback window={actual:?}"
+            ));
+        }
+    }
+}
+
+/// Glide 2 fullscreen callers may pass NULL for `grSstWinOpen`'s HWND. NULL
+/// has fullscreen semantics for older Glide hardware, but Vulkan still
+/// needs a real HWND. Reuse the active game window when available so output
+/// stays in the game's existing window; otherwise create a private per-process
+/// window. Wine cannot create a Win32 Vulkan surface from HWND 0.
+#[cfg(windows)]
+fn resolve_surface_hwnd(requested: usize, hinstance: isize, w: u32, h: u32) -> Option<isize> {
+    if requested != 0 {
+        let hwnd = requested as isize;
+        *LAST_GLIDE_HWND.lock().ok()? = Some((hwnd, false));
+        return Some(hwnd);
+    }
+    let cached = {
+        let mut last = LAST_GLIDE_HWND.lock().ok()?;
+        match *last {
+            Some((hwnd, owned)) if glidevk_core::win32::is_window(hwnd) => Some((hwnd, owned)),
+            _ => {
+                *last = None;
+                None
+            }
+        }
+    };
+    if let Some((hwnd, owned)) = cached {
+        if owned {
+            glidevk_core::win32::show_glide_window(hwnd);
+            glidevk_core::win32::resize_glide_window(hwnd, w, h);
+        }
+        return Some(hwnd);
+    }
+
+    let active = glidevk_core::win32::active_window();
+    if active != 0 {
+        *LAST_GLIDE_HWND.lock().ok()? = Some((active, false));
+        glidevk_log(&format!(
+            "grSstWinOpen: NULL HWND; using active game window {active:#x}"
+        ));
+        return Some(active);
+    }
+
+    let hwnd = glidevk_core::win32::create_glide_window(hinstance, w, h);
+    if hwnd != 0 {
+        *LAST_GLIDE_HWND.lock().ok()? = Some((hwnd, true));
+        glidevk_log(&format!(
+            "grSstWinOpen: created private Glide surface window {hwnd:#x} for NULL HWND"
+        ));
+        Some(hwnd)
+    } else {
+        None
     }
 }
 
@@ -66,6 +190,27 @@ fn log_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("GLIDEVK_LOG").is_some())
 }
 
+/// Keep lifecycle, slow-call and performance logs without the high-volume
+/// texture/vertex dumps and call trace used for rendering investigations.
+fn profile_only() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLIDEVK_PROFILE_ONLY").is_some())
+}
+
+fn detail_log_enabled() -> bool {
+    log_enabled() && !profile_only()
+}
+
+fn texture_dump_dir() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<String>> = OnceLock::new();
+    DIR.get_or_init(|| std::env::var("GLIDEVK_TEXDUMP").ok())
+        .as_deref()
+}
+
+/// `GLIDEVK_LOG=1` writes to `glidevk.log` in the game's working directory;
+/// any other value is used as the path.
 fn glidevk_log(msg: &str) {
     use std::io::Write;
     let path = match std::env::var("GLIDEVK_LOG") {
@@ -94,6 +239,9 @@ use std::sync::atomic::Ordering;
 /// sequencing (texture download vs palette vs bind vs draw) can be read
 /// directly.
 fn trace_on() -> bool {
+    if profile_only() {
+        return false;
+    }
     use std::sync::OnceLock;
     static RANGE: OnceLock<(u32, u32)> = OnceLock::new();
     static TIME: OnceLock<Option<(f32, f32)>> = OnceLock::new();
@@ -132,6 +280,37 @@ fn log_elapsed() -> f32 {
     T0.get_or_init(std::time::Instant::now)
         .elapsed()
         .as_secs_f32()
+}
+
+static PRESENT_ERROR_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static DRAW_ERROR_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CLEAR_ERROR_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn log_backend_error(
+    operation: &str,
+    error: &glidevk_core::vk::Error,
+    count: &std::sync::atomic::AtomicU32,
+) {
+    if log_enabled() && count.fetch_add(1, Ordering::Relaxed) < 20 {
+        glidevk_log(&format!(
+            "{operation} FAILED frame={}: {error:?}",
+            FRAME.load(Ordering::Relaxed)
+        ));
+    }
+}
+static DROPPED_DRAW_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LFB_LOCK_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LFB_WRITE_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn log_slow(operation: &str, elapsed: std::time::Duration, detail: impl FnOnce() -> String) {
+    if !log_enabled() || elapsed < std::time::Duration::from_millis(100) {
+        return;
+    }
+    glidevk_log(&format!(
+        "slow {operation}: {:.1}ms {}",
+        elapsed.as_secs_f64() * 1000.0,
+        detail()
+    ));
 }
 
 fn trace(msg: &str) {
@@ -196,7 +375,7 @@ fn log_texcoords(tris: &[DrawVertex], tex_size: [f32; 2], shade: &str) {
     use std::collections::HashSet;
     use std::hash::{Hash, Hasher};
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-    if !log_enabled() || tris.len() < 3 {
+    if !detail_log_enabled() || tris.len() < 3 {
         return;
     }
     if TEXLOG_COUNT.load(Ordering::Relaxed) >= TEXLOG_MAX {
@@ -265,7 +444,7 @@ unsafe fn log_raw_vertex(base: *const u8, nverts: i32) {
     use std::collections::HashSet;
     use std::hash::{Hash, Hasher};
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-    if !log_enabled() {
+    if !detail_log_enabled() {
         return;
     }
     if RAWLOG_COUNT.load(Ordering::Relaxed) >= RAWLOG_MAX {
@@ -361,6 +540,31 @@ fn unpack_constant_color(c: u32) -> [f32; 4] {
 
 fn with_ctx<R>(f: impl FnOnce(&mut Context) -> R) -> Option<R> {
     let mut guard = CONTEXT.lock().ok()?;
+    guard.as_mut().map(f)
+}
+
+/// Attribute rare draw stalls without emitting a line for every draw.
+fn profile_draw_stage<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    static LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !log_enabled() || !profile_only() {
+        return f();
+    }
+    let start = std::time::Instant::now();
+    let result = f();
+    let elapsed = start.elapsed();
+    if elapsed >= std::time::Duration::from_millis(50) && LINES.fetch_add(1, Ordering::Relaxed) < 40
+    {
+        glidevk_log(&format!(
+            "draw slow {name}: {:.1}ms frame={}",
+            elapsed.as_secs_f64() * 1000.0,
+            FRAME.load(Ordering::Relaxed)
+        ));
+    }
+    result
+}
+
+fn with_draw_ctx<R>(f: impl FnOnce(&mut Context) -> R) -> Option<R> {
+    let mut guard = profile_draw_stage("context_lock", || CONTEXT.lock()).ok()?;
     guard.as_mut().map(f)
 }
 
@@ -465,29 +669,52 @@ fn apply_depth_mode(mode: DepthMode, tris: &mut [DrawVertex]) {
 /// Bind the texture selected by `grTexSource` for a draw (see
 /// `Context::bind_for_draw`), logging each freshly decoded palette variant.
 fn bind_draw_texture(ctx: &mut Context) {
-    let t0 = std::time::Instant::now();
-    let Some(up) = ctx.bind_for_draw() else {
+    let t0 = log_enabled().then(std::time::Instant::now);
+    let up = ctx.bind_for_draw();
+    let elapsed = t0.map(|t| t.elapsed());
+    if let Some(elapsed) = elapsed {
+        log_slow("texture bind", elapsed, || {
+            format!(
+                "frame={} addr={:#x}",
+                FRAME.load(Ordering::Relaxed),
+                ctx.bound_texture
+            )
+        });
+    }
+    let Some(up) = up else {
         return;
     };
-    perf_upload(t0.elapsed().as_nanos() as u64);
+    if let Some(elapsed) = elapsed {
+        perf_upload(elapsed.as_nanos() as u64);
+    }
     let tex = &up.texture;
-    let n = (tex.rgba.len() / 4).max(1) as u64;
-    let avg = |c: usize| tex.rgba.chunks_exact(4).map(|p| p[c] as u64).sum::<u64>() / n;
-    log_distinct(
-        8 << 40 | (up.addr as u64) << 8 | avg(0),
-        &format!(
-            "p8 variant frame={} addr={:#x} palette={} {}x{} avgRGB=({},{},{})",
-            FRAME.load(Ordering::Relaxed),
-            up.addr,
-            up.palette_id,
-            tex.width,
-            tex.height,
-            avg(0),
-            avg(1),
-            avg(2)
-        ),
-    );
-    if let Ok(dir) = std::env::var("GLIDEVK_TEXDUMP") {
+    if detail_log_enabled() {
+        let n = (tex.rgba.len() / 4).max(1) as u64;
+        let avg = |c: usize| {
+            tex.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| p[c] as u64)
+                .sum::<u64>()
+                / n
+        };
+        log_distinct(
+            8 << 40 | (up.addr as u64) << 8 | avg(0),
+            &format!(
+                "p8 variant frame={} addr={:#x} palette={} {}x{} avgRGB=({},{},{})",
+                FRAME.load(Ordering::Relaxed),
+                up.addr,
+                up.palette_id,
+                tex.width,
+                tex.height,
+                avg(0),
+                avg(1),
+                avg(2)
+            ),
+        );
+    }
+    if let Some(dir) = texture_dump_dir() {
         write_ppm(
             &format!(
                 "{dir}/p8_{:#07x}_pal{}_{}x{}.ppm",
@@ -511,8 +738,38 @@ struct Perf {
     upload_ns: u64,
     submit_ns: u64,
     present_ns: u64,
+    max_draw_ns: u64,
+    max_upload_ns: u64,
+    max_present_ns: u64,
+    clears: u64,
+    clears_after_draw: u64,
+    frames_without_clear: u32,
+    frame_had_clear: bool,
+    frame_had_draw: bool,
     frames: u32,
     since: Option<std::time::Instant>,
+}
+impl Perf {
+    fn start(now: std::time::Instant) -> Self {
+        Self {
+            draws: 0,
+            tris: 0,
+            uploads: 0,
+            upload_ns: 0,
+            submit_ns: 0,
+            present_ns: 0,
+            max_draw_ns: 0,
+            max_upload_ns: 0,
+            max_present_ns: 0,
+            clears: 0,
+            clears_after_draw: 0,
+            frames_without_clear: 0,
+            frame_had_clear: false,
+            frame_had_draw: false,
+            frames: 0,
+            since: Some(now),
+        }
+    }
 }
 static PERF: Mutex<Perf> = Mutex::new(Perf {
     draws: 0,
@@ -521,6 +778,14 @@ static PERF: Mutex<Perf> = Mutex::new(Perf {
     upload_ns: 0,
     submit_ns: 0,
     present_ns: 0,
+    max_draw_ns: 0,
+    max_upload_ns: 0,
+    max_present_ns: 0,
+    clears: 0,
+    clears_after_draw: 0,
+    frames_without_clear: 0,
+    frame_had_clear: false,
+    frame_had_draw: false,
     frames: 0,
     since: None,
 });
@@ -528,17 +793,38 @@ const PERF_EVERY: u32 = 120;
 
 /// Record one texture decode+upload (`grTexDownload*`, or a palette variant).
 fn perf_upload(ns: u64) {
+    if !log_enabled() {
+        return;
+    }
     if let Ok(mut p) = PERF.lock() {
         p.uploads += 1;
         p.upload_ns += ns;
+        p.max_upload_ns = p.max_upload_ns.max(ns);
     }
 }
 
 fn perf_draw(tris: u64, ns: u64) {
+    if !log_enabled() {
+        return;
+    }
     if let Ok(mut p) = PERF.lock() {
         p.draws += 1;
+        p.frame_had_draw = true;
         p.tris += tris;
         p.submit_ns += ns;
+        p.max_draw_ns = p.max_draw_ns.max(ns);
+    }
+}
+
+/// Count clears and whether they occur after geometry in the same frame.
+fn perf_clear() {
+    if !log_enabled() {
+        return;
+    }
+    if let Ok(mut p) = PERF.lock() {
+        p.clears += 1;
+        p.clears_after_draw += u64::from(p.frame_had_draw);
+        p.frame_had_clear = true;
     }
 }
 
@@ -549,15 +835,26 @@ fn perf_frame(present_ns: u64) {
     let Ok(mut p) = PERF.lock() else {
         return;
     };
+    if p.since.is_none() {
+        // Discard startup work before the first swap; otherwise it is charged
+        // to a later 120-frame sample whose timer starts only at that swap.
+        *p = Perf::start(std::time::Instant::now());
+        TEX_MISSES.store(0, Ordering::Relaxed);
+        return;
+    }
     p.present_ns += present_ns;
+    p.max_present_ns = p.max_present_ns.max(present_ns);
     p.frames += 1;
-    let since = *p.since.get_or_insert_with(std::time::Instant::now);
+    p.frames_without_clear += u32::from(!p.frame_had_clear);
+    p.frame_had_clear = false;
+    p.frame_had_draw = false;
+    let since = p.since.expect("initialized above");
     if p.frames >= PERF_EVERY {
         let secs = since.elapsed().as_secs_f64().max(1e-6);
         let f = p.frames as f64;
         glidevk_log(&format!(
             "perf fps={:.1} draws/frame={:.0} tris/frame={:.0} submit={:.2}ms/frame present={:.2}ms/frame \
-             uploads/frame={:.0} upload={:.2}ms/frame texmiss/frame={:.1}",
+             uploads/frame={:.0} upload={:.2}ms/frame texmiss/frame={:.1} max_draw={:.2}ms max_upload={:.2}ms max_present={:.2}ms clears={} no_clear_frames={} clears_after_draw={}",
             f / secs,
             p.draws as f64 / f,
             p.tris as f64 / f,
@@ -565,18 +862,15 @@ fn perf_frame(present_ns: u64) {
             p.present_ns as f64 / f / 1e6,
             p.uploads as f64 / f,
             p.upload_ns as f64 / f / 1e6,
-            TEX_MISSES.swap(0, Ordering::Relaxed) as f64 / f
+            TEX_MISSES.swap(0, Ordering::Relaxed) as f64 / f,
+            p.max_draw_ns as f64 / 1e6,
+            p.max_upload_ns as f64 / 1e6,
+            p.max_present_ns as f64 / 1e6,
+            p.clears,
+            p.frames_without_clear,
+            p.clears_after_draw
         ));
-        *p = Perf {
-            draws: 0,
-            tris: 0,
-            uploads: 0,
-            upload_ns: 0,
-            submit_ns: 0,
-            present_ns: 0,
-            frames: 0,
-            since: Some(std::time::Instant::now()),
-        };
+        *p = Perf::start(std::time::Instant::now());
     }
 }
 
@@ -584,14 +878,18 @@ fn submit_fan(verts: &[DrawVertex]) {
     if verts.len() < 3 {
         return;
     }
-    let t0 = std::time::Instant::now();
-    let mut tris = Vec::with_capacity((verts.len() - 2) * 3);
-    for i in 1..verts.len() - 1 {
-        tris.extend_from_slice(&[verts[0], verts[i], verts[i + 1]]);
-    }
+    let t0 = log_enabled().then(std::time::Instant::now);
+    let mut tris = profile_draw_stage("fan_assembly", || {
+        let mut tris = Vec::with_capacity((verts.len() - 2) * 3);
+        for i in 1..verts.len() - 1 {
+            tris.extend_from_slice(&[verts[0], verts[i], verts[i + 1]]);
+        }
+        tris
+    });
     let mut tex_size = [1.0, 1.0];
     let mut shade = String::new();
-    with_ctx(|ctx| {
+    let mut draw_error = None;
+    with_draw_ctx(|ctx| {
         let combine = CombineParams::from_state(&ctx.state);
         let blend = BlendConfig::from_state(&ctx.state);
         let depth = DepthConfig::from_state(&ctx.state);
@@ -602,10 +900,11 @@ fn submit_fan(verts: &[DrawVertex]) {
             ctx.state.chroma_key[2],
         ];
         let (atf, atr) = (ctx.state.alpha_test_func, ctx.state.alpha_test_ref);
-        if log_enabled() {
+        let tracing = trace_on();
+        if tracing || (detail_log_enabled() && TEXLOG_COUNT.load(Ordering::Relaxed) < TEXLOG_MAX) {
             shade = shade_desc(&ctx.state);
         }
-        if trace_on() {
+        if tracing {
             let v = &verts[0];
             let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
             for v in verts {
@@ -636,11 +935,18 @@ fn submit_fan(verts: &[DrawVertex]) {
             b.set_chroma(chroma_enable, chroma);
             b.set_alpha_test(atf, atr);
             b.set_clamp(ctx.state.tex_clamp);
-            let _ = b.draw_triangles(&tris);
+            if let Err(error) = profile_draw_stage("backend_draw", || b.draw_triangles(&tris)) {
+                draw_error = Some(error);
+            }
             tex_size = b.current_tex_size();
         }
     });
-    perf_draw((tris.len() / 3) as u64, t0.elapsed().as_nanos() as u64);
+    if let Some(error) = draw_error {
+        log_backend_error("grDrawPolygonVertexList", &error, &DRAW_ERROR_LOG_COUNT);
+    }
+    if let Some(t0) = t0 {
+        perf_draw((tris.len() / 3) as u64, t0.elapsed().as_nanos() as u64);
+    }
     // Diagnostics only (GLIDEVK_LOG); file I/O deliberately outside the lock.
     log_texcoords(&tris, tex_size, &shade);
 }
@@ -712,10 +1018,56 @@ pub extern "system" fn grSstWinOpen(
     _num_aux_buffers: i32,
 ) -> FxBool {
     COLOR_FORMAT.store(_color_format, Ordering::Relaxed);
+    let requested_hwnd = hwnd;
+    #[cfg(windows)]
+    let (hwnd, w, h, hinstance) = {
+        let (w, h) = resolution_to_size(screen_resolution);
+        // SAFETY: GetModuleHandleW(NULL) returns this process's base HINSTANCE.
+        let hinstance = unsafe { GetModuleHandleW(core::ptr::null()) };
+        let hwnd = match resolve_surface_hwnd(hwnd, hinstance, w, h) {
+            Some(hwnd) => hwnd,
+            None => {
+                glidevk_log("grSstWinOpen: could not resolve or create an HWND for Vulkan");
+                return 0;
+            }
+        };
+        // GR_RESOLUTION_NONE asks to use the existing window dimensions.
+        let (w, h) = if screen_resolution == 0xff {
+            glidevk_core::win32::window_info(hwnd)
+                .map(|(_, w, h)| (w, h))
+                .filter(|&(w, h)| w > 0 && h > 0)
+                .unwrap_or((w, h))
+        } else {
+            (w, h)
+        };
+        (hwnd as usize, w, h, hinstance)
+    };
+    #[cfg(windows)]
+    {
+        glidevk_log("GlideVK diagnostic build: draw timing and frame clear counts");
+        glidevk_log(&format!(
+            "grSstWinOpen: requested_hwnd={requested_hwnd:#x} surface_hwnd={hwnd:#x} res={screen_resolution} cformat={_color_format} -> {w}x{h} (0=ARGB 1=ABGR 2=RGBA 3=BGRA)"
+        ));
+        // Window style changes can synchronously dispatch window messages; do
+        // them before taking CONTEXT so a game callback cannot deadlock it.
+        enter_display_mode(hwnd, w, h);
+    }
     let mut guard = match CONTEXT.lock() {
         Ok(g) => g,
         Err(_) => return 0,
     };
+    #[cfg(windows)]
+    if guard.as_ref().is_some_and(|ctx| ctx.backend.is_some())
+        && BACKEND_HWND.load(Ordering::Relaxed) != hwnd as isize
+    {
+        glidevk_log(&format!(
+            "grSstWinOpen: surface window changed from {:#x} to {hwnd:#x}; rebuilding backend",
+            BACKEND_HWND.load(Ordering::Relaxed)
+        ));
+        // Vulkan surfaces are bound to an HWND and cannot follow a new one.
+        *guard = None;
+        BACKEND_HWND.store(0, Ordering::Relaxed);
+    }
     // Unreal re-opens the render device on every focus loss / mode change
     // (grSstWinClose -> grGlideShutdown -> grSstWinOpen). Tearing down and
     // recreating the whole Vulkan device on that dance is what crashes the game
@@ -724,6 +1076,7 @@ pub extern "system" fn grSstWinOpen(
     // on the next present when the window size changed.
     if let Some(existing) = guard.as_mut() {
         if let Some(b) = existing.backend.as_mut() {
+            #[cfg(not(windows))]
             let (w, h) = resolution_to_size(screen_resolution);
             b.set_origin_upper_left(origin_location == 0);
             // The re-open may ask for a different mode (Unreal re-inits at the
@@ -731,10 +1084,8 @@ pub extern "system" fn grSstWinOpen(
             // grSstScreenWidth/Height report must follow it.
             b.set_logical_size(w, h);
             glidevk_log(&format!(
-                "grSstWinOpen: reusing persistent backend (re-open) hwnd={hwnd:#x} res={screen_resolution} -> {w}x{h}"
+                "grSstWinOpen: reusing persistent backend (re-open) requested_hwnd={requested_hwnd:#x} surface_hwnd={hwnd:#x} res={screen_resolution} -> {w}x{h}"
             ));
-            #[cfg(windows)]
-            enter_display_mode(hwnd, w, h);
             return 1;
         }
     }
@@ -743,13 +1094,6 @@ pub extern "system" fn grSstWinOpen(
 
     #[cfg(windows)]
     {
-        let (w, h) = resolution_to_size(screen_resolution);
-        // SAFETY: GetModuleHandleW(NULL) returns this process's base HINSTANCE.
-        let hinstance = unsafe { GetModuleHandleW(core::ptr::null()) };
-        glidevk_log(&format!(
-            "grSstWinOpen: hwnd={hwnd:#x} res={screen_resolution} cformat={_color_format} -> {w}x{h} (0=ARGB 1=ABGR 2=RGBA 3=BGRA)"
-        ));
-        enter_display_mode(hwnd, w, h);
         // The window may not be fully mapped the instant Glide is initialized;
         // retry briefly so a transient surface/swapchain failure doesn't abort
         // the whole render-device init ("3d hardware initialization failed").
@@ -785,6 +1129,7 @@ pub extern "system" fn grSstWinOpen(
                     backend.set_capture(glidevk_core::vk::CaptureMode::from_frame_arg(frame));
                 }
                 ctx.backend = Some(backend);
+                BACKEND_HWND.store(hwnd as isize, Ordering::Relaxed);
             }
             Err(e) => {
                 glidevk_log(&format!("grSstWinOpen: new_windowed FAILED: {e:?}"));
@@ -810,8 +1155,28 @@ pub extern "system" fn grSstWinClose() {
     // Give the desktop back (Unreal closes on focus loss and drops to its
     // windowed software renderer until the window is restored).
     #[cfg(windows)]
-    if !windowed() {
-        glidevk_core::win32::restore_display_mode();
+    {
+        let original = WINDOWED_RESTORE
+            .lock()
+            .ok()
+            .and_then(|mut state| state.take());
+        if let Some(original) = original {
+            if let Err(code) = glidevk_core::win32::restore_windowed_window(original) {
+                glidevk_log(&format!(
+                    "grSstWinClose: could not restore window style ({code})"
+                ));
+            }
+        }
+        let owned_hwnd = LAST_GLIDE_HWND
+            .lock()
+            .ok()
+            .and_then(|last| last.and_then(|(hwnd, owned)| owned.then_some(hwnd)));
+        if let Some(hwnd) = owned_hwnd {
+            glidevk_core::win32::hide_glide_window(hwnd);
+        }
+        if !windowed() {
+            glidevk_core::win32::restore_display_mode();
+        }
     }
     // Keep the backend alive across Unreal's close/re-open focus-loss dance
     // (see grSstWinOpen / grGlideShutdown). Full teardown here crashed alt-tab.
@@ -840,27 +1205,102 @@ pub extern "system" fn grSstScreenHeight() -> u32 {
 // Frame
 // ---------------------------------------------------------------------------
 
+/// Bounded profile samples of the clear arguments and write masks. Unlike a
+/// per-call trace, repeated clears do not cause file I/O on every frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ClearSample {
+    color: u32,
+    alpha: u8,
+    depth: u32,
+    rgb_write: bool,
+    alpha_write: bool,
+    depth_write: bool,
+    depth_mode: DepthMode,
+    last_requested_clip: Option<[u32; 4]>,
+}
+
+static LAST_REQUESTED_CLIP: Mutex<Option<[u32; 4]>> = Mutex::new(None);
+static CLEAR_SAMPLES: Mutex<Vec<ClearSample>> = Mutex::new(Vec::new());
+
+fn profile_clear_sample(sample: ClearSample) {
+    let fresh = match CLEAR_SAMPLES.lock() {
+        Ok(mut seen) if seen.len() < 32 && !seen.contains(&sample) => {
+            seen.push(sample);
+            true
+        }
+        _ => false,
+    };
+    if fresh {
+        glidevk_log(&format!(
+            "clear_sample frame={} color={:#010x} alpha={} depth={:#x} rgb_write={} alpha_write={} depth_write={} depth_mode={:?} last_requested_clip={:?}",
+            FRAME.load(Ordering::Relaxed), sample.color, sample.alpha, sample.depth,
+            sample.rgb_write, sample.alpha_write, sample.depth_write, sample.depth_mode,
+            sample.last_requested_clip
+        ));
+    }
+}
+
 #[export_name = "grBufferClear"]
-pub extern "system" fn grBufferClear(color: u32, _alpha: u8, _depth: u32) {
-    trace(&format!("grBufferClear {color:#010x}"));
-    let c = unpack_color(color);
-    with_ctx(|ctx| {
+pub extern "system" fn grBufferClear(color: u32, alpha: u8, depth: u32) {
+    perf_clear();
+    if trace_on() {
+        trace(&format!("grBufferClear {color:#010x}"));
+    }
+    let mut c = unpack_color(color);
+    c[3] = alpha as f32 / 255.0;
+    let profile = log_enabled() && profile_only();
+    let last_requested_clip = if profile {
+        LAST_REQUESTED_CLIP.lock().ok().and_then(|clip| *clip)
+    } else {
+        None
+    };
+    let mut clear_error = None;
+    let sample = with_ctx(|ctx| {
         ctx.clear_color = c;
         if let Some(b) = ctx.backend.as_mut() {
-            b.set_clear_color(c);
+            if let Err(error) = b.clear_masked(
+                c,
+                depth,
+                ctx.state.color_mask_rgb,
+                ctx.state.color_mask_alpha,
+                ctx.state.depth_write,
+            ) {
+                ctx.present_errors += 1;
+                clear_error = Some(error);
+            }
         }
+        profile.then_some(ClearSample {
+            color,
+            alpha,
+            depth,
+            rgb_write: ctx.state.color_mask_rgb,
+            alpha_write: ctx.state.color_mask_alpha,
+            depth_write: ctx.state.depth_write,
+            depth_mode: ctx.state.depth_mode,
+            last_requested_clip,
+        })
     });
+    if let Some(error) = clear_error {
+        log_backend_error("grBufferClear", &error, &CLEAR_ERROR_LOG_COUNT);
+    }
+    if let Some(Some(sample)) = sample {
+        profile_clear_sample(sample);
+    }
 }
 
 #[export_name = "grBufferSwap"]
 pub extern "system" fn grBufferSwap(_swap_interval: i32) {
     trace("grBufferSwap");
-    FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let t0 = std::time::Instant::now();
+    let frame = FRAME.fetch_add(1, Ordering::Relaxed);
+    let t0 = log_enabled().then(std::time::Instant::now);
+    let mut present_error = None;
+    let mut dropped_draws = 0;
     let capture = with_ctx(|ctx| {
         if let Some(b) = ctx.backend.as_mut() {
-            if b.present().is_err() {
+            dropped_draws = b.take_dropped_draws();
+            if let Err(error) = b.present() {
                 ctx.present_errors += 1;
+                present_error = Some(error);
             }
             b.take_capture()
         } else {
@@ -868,7 +1308,38 @@ pub extern "system" fn grBufferSwap(_swap_interval: i32) {
         }
     })
     .flatten();
-    perf_frame(t0.elapsed().as_nanos() as u64);
+    if dropped_draws > 0
+        && log_enabled()
+        && DROPPED_DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 20
+    {
+        glidevk_log(&format!(
+            "grBufferSwap: frame={frame} dropped_draws={dropped_draws} (vertex buffer capacity)"
+        ));
+    }
+    if let Some(t0) = t0 {
+        let elapsed = t0.elapsed();
+        perf_frame(elapsed.as_nanos() as u64);
+        log_slow("present", elapsed, || format!("frame={frame}"));
+    }
+    if let Some(error) = present_error {
+        if log_enabled() && PRESENT_ERROR_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 20 {
+            glidevk_log(&format!(
+                "grBufferSwap: present FAILED frame={frame}: {error:?}"
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if frame == 0 && windowed() && log_enabled() {
+        let hwnd = LAST_GLIDE_HWND
+            .lock()
+            .ok()
+            .and_then(|last| last.map(|(hwnd, _)| hwnd));
+        if let Some((style, width, height)) = hwnd.and_then(glidevk_core::win32::window_info) {
+            glidevk_log(&format!(
+                "GLIDEVK_WINDOWED: first swap window style={style:#010x} client={width}x{height}"
+            ));
+        }
+    }
     // Write the captured frame outside the context lock (file I/O). For interval
     // capture the frame index is appended so a whole intro can be scanned.
     if let Some((frame, w, h, rgba)) = capture {
@@ -894,8 +1365,10 @@ fn write_ppm(path: &str, w: u32, h: u32, rgba: &[u8]) {
     if let Ok(mut f) = std::fs::File::create(path) {
         let _ = write!(f, "P6\n{w} {h}\n255\n");
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-        for px in rgba.chunks_exact(4) {
-            rgb.extend_from_slice(&px[..3]);
+        let (pixels, remainder) = rgba.as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for pixel in pixels {
+            rgb.extend_from_slice(&pixel[..3]);
         }
         let _ = f.write_all(&rgb);
     }
@@ -1217,12 +1690,14 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
     if info.is_null() {
         return;
     }
-    let t0 = std::time::Instant::now();
+    let t0 = log_enabled().then(std::time::Instant::now);
     let info = &*info;
-    trace(&format!(
-        "grTexDownload addr={start_address:#x} fmt={:#x} lod={} aspect={}",
-        info.format, info.large_lod, info.aspect_ratio
-    ));
+    if trace_on() {
+        trace(&format!(
+            "grTexDownload addr={start_address:#x} fmt={:#x} lod={} aspect={}",
+            info.format, info.large_lod, info.aspect_ratio
+        ));
+    }
     if info.data.is_null() {
         return;
     }
@@ -1248,7 +1723,10 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
         // see `bind_draw_texture`. Any GPU variants of a previous texture at this
         // address are stale.
         if matches!(fmt, TexFormat::P8) {
-            ctx.download_p8(start_address, w, h, src.to_vec());
+            ctx.download_p8(start_address, w, h, src);
+            if !detail_log_enabled() && texture_dump_dir().is_none() {
+                return;
+            }
         }
         match ctx.textures.decode(fmt, w, h, src) {
             Ok(tex) => {
@@ -1258,6 +1736,7 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
                 // from the texture itself being green/masked vs. the combine.
                 log_texture_content(start_address, info.format, w, h, &tex.rgba, src);
                 if !matches!(fmt, TexFormat::P8) {
+                    ctx.clear_p8(start_address);
                     if let Some(b) = ctx.backend.as_mut() {
                         // A failed upload leaves nothing at this address, so the
                         // next bind falls back to white: never swallow it.
@@ -1265,6 +1744,8 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
                             glidevk_log(&format!(
                                 "grTexDownload: upload FAILED addr={start_address:#x} {w}x{h}: {e:?}"
                             ));
+                        } else if ctx.bound_texture == start_address {
+                            b.set_texture(start_address as u64);
                         }
                     }
                 }
@@ -1275,7 +1756,17 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
             )),
         }
     });
-    perf_upload(t0.elapsed().as_nanos() as u64);
+    if let Some(t0) = t0 {
+        let elapsed = t0.elapsed();
+        perf_upload(elapsed.as_nanos() as u64);
+        log_slow("texture download", elapsed, || {
+            format!(
+                "frame={} addr={start_address:#x} format={:#x} size={w}x{h}",
+                FRAME.load(Ordering::Relaxed),
+                info.format
+            )
+        });
+    }
 }
 
 /// Log a decoded texture's average colour + alpha coverage (deduped by address),
@@ -1286,7 +1777,9 @@ fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8], raw:
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
     static DUMPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const DUMP_MAX: u32 = 400;
-    if !log_enabled() || rgba.len() < 4 {
+    let detail = detail_log_enabled();
+    let dump_dir = texture_dump_dir();
+    if (!detail && dump_dir.is_none()) || rgba.len() < 4 {
         return;
     }
     // Unreal's texture cache reuses TMU addresses, so key on the content too
@@ -1304,7 +1797,7 @@ fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8], raw:
     let frame = FRAME.load(Ordering::Relaxed);
     // GLIDEVK_TEXDUMP=<dir>: write each distinct decoded texture as a PPM so
     // what the game uploaded can be inspected directly.
-    if let Ok(dir) = std::env::var("GLIDEVK_TEXDUMP") {
+    if let Some(dir) = dump_dir {
         if DUMPED.fetch_add(1, Ordering::Relaxed) < DUMP_MAX {
             write_ppm(
                 &format!("{dir}/tex_f{frame:05}_{addr:#07x}_{w}x{h}_fmt{format:x}.ppm"),
@@ -1313,6 +1806,9 @@ fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8], raw:
                 rgba,
             );
         }
+    }
+    if !detail {
+        return;
     }
     // Palettised textures: show the index range so an all-black decode can be
     // attributed to the indices vs the palette.
@@ -1326,12 +1822,14 @@ fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8], raw:
     };
     let (mut r, mut gg, mut b, mut a, mut opaque) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let n = rgba.len() / 4;
-    for px in rgba.chunks_exact(4) {
-        r += px[0] as u64;
-        gg += px[1] as u64;
-        b += px[2] as u64;
-        a += px[3] as u64;
-        if px[3] >= 128 {
+    let (pixels, remainder) = rgba.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for pixel in pixels {
+        r += pixel[0] as u64;
+        gg += pixel[1] as u64;
+        b += pixel[2] as u64;
+        a += pixel[3] as u64;
+        if pixel[3] >= 128 {
             opaque += 1;
         }
     }
@@ -1354,7 +1852,9 @@ pub extern "system" fn grTexSource(
     _info: *const GrTexInfo,
 ) {
     LAST_TEX_ADDR.store(start_address, Ordering::Relaxed);
-    trace(&format!("grTexSource addr={start_address:#x}"));
+    if trace_on() {
+        trace(&format!("grTexSource addr={start_address:#x}"));
+    }
     with_ctx(|ctx| {
         if !ctx.bind_texture(start_address) {
             // Nothing downloaded at that address: the backend falls back to a
@@ -1380,22 +1880,29 @@ pub unsafe extern "system" fn grTexDownloadTable(
     let src = std::slice::from_raw_parts(data as *const u32, 256);
     let mut palette = [0u32; 256];
     palette.copy_from_slice(src);
-    let nonzero = palette.iter().filter(|&&c| c & 0x00ff_ffff != 0).count();
-    trace(&format!(
-        "grTexDownloadTable nonzero={nonzero} p[1]={:#08x} p[29]={:#08x}",
-        palette[1] & 0xff_ffff,
-        palette[29] & 0xff_ffff
-    ));
-    log_distinct(
-        6 << 40 | (nonzero as u64) << 8 | (palette[1] & 0xff) as u64,
-        &format!(
-            "grTexDownloadTable type={_table_type} nonzero={nonzero}/256 p[0..8]={:06x?} p[16]={:#08x} p[29]={:#08x} p[255]={:#08x}",
-            palette[..8].iter().map(|c| c & 0xff_ffff).collect::<Vec<_>>(),
-            palette[16] & 0xff_ffff,
-            palette[29] & 0xff_ffff,
-            palette[255] & 0xff_ffff
-        ),
-    );
+    let tracing = trace_on();
+    if tracing || detail_log_enabled() {
+        let nonzero = palette.iter().filter(|&&c| c & 0x00ff_ffff != 0).count();
+        if tracing {
+            trace(&format!(
+                "grTexDownloadTable nonzero={nonzero} p[1]={:#08x} p[29]={:#08x}",
+                palette[1] & 0xff_ffff,
+                palette[29] & 0xff_ffff
+            ));
+        }
+        if detail_log_enabled() {
+            log_distinct(
+                6 << 40 | (nonzero as u64) << 8 | (palette[1] & 0xff) as u64,
+                &format!(
+                    "grTexDownloadTable type={_table_type} nonzero={nonzero}/256 p[0..8]={:06x?} p[16]={:#08x} p[29]={:#08x} p[255]={:#08x}",
+                    palette[..8].iter().map(|c| c & 0xff_ffff).collect::<Vec<_>>(),
+                    palette[16] & 0xff_ffff,
+                    palette[29] & 0xff_ffff,
+                    palette[255] & 0xff_ffff
+                ),
+            );
+        }
+    }
     // Deus Ex animates its intro logos by cycling this palette. Just record it
     // (a cheap version bump); the affected P8 textures re-decode lazily when
     // next bound for drawing, so the hundreds of redundant per-frame uploads
@@ -1403,24 +1910,57 @@ pub unsafe extern "system" fn grTexDownloadTable(
     with_ctx(|ctx| ctx.textures.set_palette(palette));
 }
 
+/// Texels occupied by each SST-1 mip level, indexed by wide aspect and LOD.
+///
+/// These are the exact `_grMipMapSize` values from 3Dfx's Glide 2 source.
+/// They are not always the mathematical `width * height`: narrow levels honor
+/// the TMU's fetch granularity (for example, 4x1 occupies eight texels).
+const GLIDE2_MIP_TEXELS: [[u64; 9]; 4] = [
+    [8_192, 2_048, 512, 128, 32, 16, 8, 4, 4],         // 8x1
+    [16_384, 4_096, 1_024, 256, 64, 16, 8, 4, 4],      // 4x1
+    [32_768, 8_192, 2_048, 512, 128, 32, 8, 4, 4],     // 2x1
+    [65_536, 16_384, 4_096, 1_024, 256, 64, 16, 4, 4], // 1x1
+];
+
+/// Calculate the TMU bytes occupied by a Glide 2 mipmap chain.
+///
+/// Glide 2 encodes LODs in descending size order: 0 is 256 texels and 8 is
+/// 1 texel. The original 3Dfx implementation sums every level in the inclusive
+/// `large_lod..=small_lod` range, gives each level a four-texel minimum, and
+/// rounds the final byte count up to the TMU's eight-byte alignment.
+fn tex_mem_required(small_lod: u32, large_lod: u32, aspect: u32, format: u32) -> u32 {
+    let large_lod = large_lod.min(8);
+    let small_lod = small_lod.min(8).max(large_lod);
+
+    // The SST-1 mip-size table stores only wide aspects and mirrors tall
+    // aspects onto their transposed representation.
+    let aspect = match aspect.min(6) {
+        4..=6 => 6 - aspect.min(6),
+        aspect => aspect,
+    };
+
+    let texels = GLIDE2_MIP_TEXELS[aspect as usize][large_lod as usize..=small_lod as usize]
+        .iter()
+        .sum::<u64>();
+
+    // Glide 2's format encoding, rather than a validated format enum, decides
+    // the texel width. Values >= GR_TEXFMT_16BIT are two bytes; all others,
+    // including malformed game-supplied values, are one byte.
+    let bytes_per_texel = if format >= 0x08 { 2 } else { 1 };
+    let bytes = texels.saturating_mul(bytes_per_texel);
+    let aligned = bytes.saturating_add(7) & !7;
+    aligned.min(u32::MAX as u64) as u32
+}
+
 /// `grTexCalcMemRequired(smallLod, largeLod, aspect, format)` -> bytes.
 #[export_name = "grTexCalcMemRequired"]
 pub extern "system" fn grTexCalcMemRequired(
-    _small_lod: u32,
+    small_lod: u32,
     large_lod: u32,
     aspect: u32,
     format: u32,
 ) -> u32 {
-    let info = GrTexInfo {
-        small_lod: large_lod,
-        large_lod,
-        aspect_ratio: aspect,
-        format,
-        data: core::ptr::null(),
-    };
-    let (w, h) = tex_dims(&info);
-    let bpp = map_texfmt(format).map(texfmt_bpp).unwrap_or(2);
-    (w * h) * bpp as u32
+    tex_mem_required(small_lod, large_lod, aspect, format)
 }
 
 const TMU_MEMORY_BYTES: u32 = 4 * 1024 * 1024;
@@ -1445,16 +1985,19 @@ pub unsafe extern "system" fn grDrawTriangle(
     b: *const core::ffi::c_void,
     c: *const core::ffi::c_void,
 ) {
-    let t0 = std::time::Instant::now();
+    let t0 = log_enabled().then(std::time::Instant::now);
     log_raw_vertex(a as *const u8, 3);
-    let mut tris = [
-        read_vertex(a as *const u8),
-        read_vertex(b as *const u8),
-        read_vertex(c as *const u8),
-    ];
+    let mut tris = profile_draw_stage("triangle_vertex_read", || {
+        [
+            read_vertex(a as *const u8),
+            read_vertex(b as *const u8),
+            read_vertex(c as *const u8),
+        ]
+    });
     let mut tex_size = [1.0, 1.0];
     let mut shade = String::new();
-    with_ctx(|ctx| {
+    let mut draw_error = None;
+    with_draw_ctx(|ctx| {
         let combine = CombineParams::from_state(&ctx.state);
         let blend = BlendConfig::from_state(&ctx.state);
         let depth = DepthConfig::from_state(&ctx.state);
@@ -1465,7 +2008,7 @@ pub unsafe extern "system" fn grDrawTriangle(
             ctx.state.chroma_key[2],
         ];
         let (atf, atr) = (ctx.state.alpha_test_func, ctx.state.alpha_test_ref);
-        if log_enabled() {
+        if detail_log_enabled() && TEXLOG_COUNT.load(Ordering::Relaxed) < TEXLOG_MAX {
             shade = shade_desc(&ctx.state);
         }
         apply_depth_mode(ctx.state.depth_mode, &mut tris);
@@ -1477,11 +2020,18 @@ pub unsafe extern "system" fn grDrawTriangle(
             bk.set_chroma(ce, ck);
             bk.set_alpha_test(atf, atr);
             bk.set_clamp(ctx.state.tex_clamp);
-            let _ = bk.draw_triangles(&tris);
+            if let Err(error) = profile_draw_stage("backend_draw", || bk.draw_triangles(&tris)) {
+                draw_error = Some(error);
+            }
             tex_size = bk.current_tex_size();
         }
     });
-    perf_draw(1, t0.elapsed().as_nanos() as u64);
+    if let Some(error) = draw_error {
+        log_backend_error("grDrawTriangle", &error, &DRAW_ERROR_LOG_COUNT);
+    }
+    if let Some(t0) = t0 {
+        perf_draw(1, t0.elapsed().as_nanos() as u64);
+    }
     log_texcoords(&tris, tex_size, &shade);
 }
 
@@ -1495,9 +2045,11 @@ pub unsafe extern "system" fn grDrawPolygonVertexList(
     }
     let base = vlist as *const u8;
     log_raw_vertex(base, nverts);
-    let verts: Vec<DrawVertex> = (0..nverts as usize)
-        .map(|i| read_vertex(base.add(i * GRVERTEX_SIZE)))
-        .collect();
+    let verts: Vec<DrawVertex> = profile_draw_stage("fan_vertex_read", || {
+        (0..nverts as usize)
+            .map(|i| read_vertex(base.add(i * GRVERTEX_SIZE)))
+            .collect()
+    });
     submit_fan(&verts);
 }
 
@@ -1525,14 +2077,16 @@ pub struct GrLfbInfo {
 
 #[export_name = "grLfbLock"]
 pub unsafe extern "system" fn grLfbLock(
-    _lock_type: u32,
-    _buffer: u32,
+    lock_type: u32,
+    buffer: u32,
     write_mode: i32,
     origin: i32,
-    _pixel_pipeline: FxBool,
+    pixel_pipeline: FxBool,
     info: *mut GrLfbInfo,
 ) -> FxBool {
-    glidevk_log(&format!("grLfbLock mode={write_mode}"));
+    if log_enabled() && LFB_LOCK_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 10 {
+        glidevk_log(&format!("grLfbLock frame={} type={lock_type} buffer={buffer} mode={write_mode} origin={origin} pixel_pipeline={pixel_pipeline}", FRAME.load(Ordering::Relaxed)));
+    }
     if info.is_null() {
         return 0;
     }
@@ -1601,15 +2155,18 @@ pub unsafe extern "system" fn grLfbReadRegion(
 
 #[export_name = "grLfbWriteRegion"]
 pub extern "system" fn grLfbWriteRegion(
-    _dst_buffer: u32,
-    _dst_x: u32,
-    _dst_y: u32,
-    _fmt: u32,
-    _src_w: u32,
-    _src_h: u32,
-    _src_stride: u32,
+    dst_buffer: u32,
+    dst_x: u32,
+    dst_y: u32,
+    fmt: u32,
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
     _src_data: *const core::ffi::c_void,
 ) -> FxBool {
+    if log_enabled() && LFB_WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 10 {
+        glidevk_log(&format!("grLfbWriteRegion UNIMPLEMENTED frame={} buffer={dst_buffer} x={dst_x} y={dst_y} format={fmt} size={src_w}x{src_h} stride={src_stride}", FRAME.load(Ordering::Relaxed)));
+    }
     1
 }
 
@@ -1638,7 +2195,21 @@ pub extern "system" fn grColorMask(rgb: FxBool, alpha: FxBool) {
     });
 }
 stub!("grDitherMode", gr_dither_mode(mode: i32));
-stub!("grClipWindow", gr_clip_window(minx: u32, miny: u32, maxx: u32, maxy: u32));
+/// Limit subsequent rasterization to the logical Glide clip window.
+#[export_name = "grClipWindow"]
+pub extern "system" fn gr_clip_window(minx: u32, miny: u32, maxx: u32, maxy: u32) {
+    if log_enabled() && profile_only() {
+        if let Ok(mut last) = LAST_REQUESTED_CLIP.lock() {
+            *last = Some([minx, miny, maxx, maxy]);
+        }
+    }
+    with_ctx(|ctx| {
+        if let Some(backend) = ctx.backend.as_mut() {
+            backend.set_clip_window([minx, miny, maxx, maxy]);
+        }
+    });
+}
+stub!("grCullMode", gr_cull_mode(mode: i32));
 stub!("grDepthBiasLevel", gr_depth_bias(level: i16));
 stub!("grDrawLine", gr_draw_line(a: *const core::ffi::c_void, b: *const core::ffi::c_void));
 stub!("grErrorSetCallback", gr_error_cb(cb: *const core::ffi::c_void));
@@ -1775,5 +2346,55 @@ mod tests {
             ..info
         };
         assert_eq!(tex_dims(&info8), (8, 8)); // GR_LOD_8 = 5
+    }
+
+    #[test]
+    fn tex_mem_required_includes_whole_mipmap_chain() {
+        // 256..1 square, RGB565. Every texel count is from the original
+        // SST-1 table, including its four-texel minimum for both final levels.
+        let expected_texels = 65_536 + 16_384 + 4_096 + 1_024 + 256 + 64 + 16 + 4 + 4;
+        assert_eq!(
+            grTexCalcMemRequired(8, 0, 3, 0x0a),
+            (expected_texels * 2) as u32
+        );
+
+        // One level remains the old base-level result: 256x256 RGB565.
+        assert_eq!(grTexCalcMemRequired(0, 0, 3, 0x0a), 256 * 256 * 2);
+    }
+
+    #[test]
+    fn tex_mem_required_matches_aspects_formats_and_padding() {
+        // 8x1 and 1x8 mirror to the same SST-1 mip-size table.
+        let wide = grTexCalcMemRequired(8, 0, 0, 0x0a);
+        let tall = grTexCalcMemRequired(8, 0, 6, 0x0a);
+        assert_eq!(wide, tall);
+        assert_eq!(wide, (8_192 + 2_048 + 512 + 128 + 32 + 16 + 8 + 4 + 4) * 2);
+
+        // P8 is one byte per texel. This inclusive range includes every level
+        // from 64x64 through 8x8, not just the base level.
+        assert_eq!(
+            grTexCalcMemRequired(5, 2, 3, 0x05),
+            (4_096 + 1_024 + 256 + 64) as u32
+        );
+
+        // Even a 1x1 level occupies the SST-1's four-texel minimum, and a
+        // one-byte format therefore still consumes an aligned eight bytes.
+        assert_eq!(grTexCalcMemRequired(8, 8, 3, 0x05), 8);
+
+        // The original API classifies unknown formats by encoding, so this
+        // malformed large value must be treated as 16-bit rather than fault.
+        assert_eq!(
+            grTexCalcMemRequired(8, 8, 3, u32::MAX),
+            grTexCalcMemRequired(8, 8, 3, 0x0a)
+        );
+    }
+
+    #[test]
+    fn tex_mem_required_is_bounded_for_invalid_dimensions() {
+        // These arguments are outside the documented API. The important ABI
+        // compatibility property is that a bad caller gets a bounded aligned
+        // size instead of indexing out of bounds or panicking across the FFI.
+        let full_chain = grTexCalcMemRequired(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(full_chain % 8, 0);
     }
 }

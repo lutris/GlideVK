@@ -1,0 +1,111 @@
+name: Windows DLLs
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-dlls-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # build-std is unstable. Pin the nightly tested by the release workflow so a
+  # future nightly regression cannot silently break DLL releases.
+  NIGHTLY_TOOLCHAIN: nightly-2026-10-25
+
+jobs:
+  build:
+    name: Build i686 PE DLLs
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install MinGW cross-toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install "$NIGHTLY_TOOLCHAIN" --profile minimal --component rust-src --target i686-pc-windows-gnu
+          rustup default stable
+
+      - name: Test
+        run: cargo +stable test --locked --workspace
+
+      - name: Lint
+        run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Build release DLLs
+        run: >-
+          cargo +"$NIGHTLY_TOOLCHAIN" build --locked
+          -Z build-std=std,panic_abort --release --target i686-pc-windows-gnu
+
+      - name: Verify and stage DLLs
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp target/i686-pc-windows-gnu/release/glide2x.dll dist/
+          cp target/i686-pc-windows-gnu/release/glide3x.dll dist/
+
+          file dist/glide2x.dll dist/glide3x.dll | tee file-types.txt
+          file dist/glide2x.dll | grep -q 'PE32 executable (DLL).*Intel 80386'
+          file dist/glide3x.dll | grep -q 'PE32 executable (DLL).*Intel 80386'
+
+          # Both shells deliberately export stdcall aliases for their primary
+          # texture-memory entry point. This catches linker/.def regressions.
+          i686-w64-mingw32-objdump -p dist/glide2x.dll | grep -q '_grTexCalcMemRequired@16'
+          i686-w64-mingw32-objdump -p dist/glide3x.dll | grep -q 'grTexCalcMemRequired'
+
+          (
+            cd dist
+            sha256sum glide2x.dll glide3x.dll | tee SHA256SUMS
+          )
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: glidevk-i686-windows
+          path: |
+            dist/glide2x.dll
+            dist/glide3x.dll
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Attach DLLs to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download DLL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: glidevk-i686-windows
+          path: release
+
+      - name: Upload release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --generate-notes --title "$tag"
+          gh release upload "$tag" \
+            release/glide2x.dll release/glide3x.dll release/SHA256SUMS \
+            --clobber

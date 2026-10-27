@@ -200,21 +200,38 @@ impl TextureCache {
         self.palette_id
     }
 
-    /// Remember a P8 texture's raw index data for draw-time decoding. Any GPU
-    /// variants of a previous texture at this address are stale; their keys are
-    /// returned for the backend to release.
-    pub fn store_p8_source(
-        &mut self,
-        addr: u32,
-        width: u32,
-        height: u32,
-        src: Vec<u8>,
-    ) -> Vec<u64> {
-        self.p8_sources.insert(addr, (width, height, src));
+    /// Remember P8 index data for draw-time decoding. An identical download
+    /// preserves resident variants; changed data invalidates them.
+    pub fn store_p8_source(&mut self, addr: u32, width: u32, height: u32, src: &[u8]) -> Vec<u64> {
+        if self
+            .p8_sources
+            .get(&addr)
+            .is_some_and(|(w, h, old)| *w == width && *h == height && old.as_slice() == src)
+        {
+            return Vec::new();
+        }
+        self.p8_sources.insert(addr, (width, height, src.to_vec()));
+        self.remove_p8_variants(addr)
+    }
+
+    /// A non-P8 download replaces any P8 source at the same address.
+    pub fn remove_p8_source(&mut self, addr: u32) -> Vec<u64> {
+        self.p8_sources.remove(&addr);
+        self.remove_p8_variants(addr)
+    }
+
+    fn remove_p8_variants(&mut self, addr: u32) -> Vec<u64> {
         self.p8_variants
             .remove(&addr)
             .map(|ids| ids.into_iter().map(|id| variant_key(addr, id)).collect())
             .unwrap_or_default()
+    }
+
+    /// A failed GPU upload must be retried on the next draw.
+    pub fn forget_p8_variant(&mut self, addr: u32, palette_id: u64) {
+        if let Some(variants) = self.p8_variants.get_mut(&addr) {
+            variants.retain(|&id| id != palette_id);
+        }
     }
 
     /// Whether `addr` holds a palettised texture.
@@ -267,9 +284,11 @@ fn as_u16_slice(src: &[u8], texels: usize) -> Result<Vec<u16>, DecodeError> {
     if src.len() < texels * 2 {
         return Err(DecodeError::ShortBuffer);
     }
-    Ok(src[..texels * 2]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+    let (chunks, remainder) = src[..texels * 2].as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    Ok(chunks
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -291,7 +310,7 @@ mod tests {
         let mut zero = [0u32; 256];
         zero[1] = 0;
         c.set_palette(zero);
-        assert!(c.store_p8_source(0x40, 2, 2, vec![1, 1, 1, 1]).is_empty());
+        assert!(c.store_p8_source(0x40, 2, 2, &[1, 1, 1, 1]).is_empty());
         let mut gray = [0u32; 256];
         gray[1] = 0x80_80_80;
         c.set_palette(gray);
@@ -308,8 +327,27 @@ mod tests {
         c.set_palette(gray);
         assert!(c.p8_draw(0x40).unwrap().upload.is_none());
         // A new texture at the address invalidates its variants.
-        let released = c.store_p8_source(0x40, 2, 2, vec![0; 4]);
+        let released = c.store_p8_source(0x40, 2, 2, &[0; 4]);
         assert_eq!(released.len(), 2);
+    }
+
+    #[test]
+    fn p8_repeated_download_preserves_only_identical_sources() {
+        let mut cache = TextureCache::default();
+        let src = [1, 2, 3, 4];
+        cache.store_p8_source(7, 2, 2, &src);
+        assert!(cache.p8_draw(7).unwrap().upload.is_some());
+        cache.forget_p8_variant(7, cache.palette_id());
+        assert!(cache.p8_draw(7).unwrap().upload.is_some());
+        assert!(cache.store_p8_source(7, 2, 2, &src).is_empty());
+        assert!(cache.p8_draw(7).unwrap().upload.is_none());
+        assert_eq!(cache.store_p8_source(7, 2, 2, &[1, 2, 3, 5]).len(), 1);
+        assert!(cache.p8_draw(7).unwrap().upload.is_some());
+        assert_eq!(cache.store_p8_source(7, 1, 4, &[1, 2, 3, 5]).len(), 1);
+        assert!(cache.p8_draw(7).unwrap().upload.is_some());
+        assert_eq!(cache.remove_p8_source(7).len(), 1);
+        assert!(!cache.is_p8(7));
+        assert!(cache.p8_draw(7).is_none());
     }
 
     #[test]
